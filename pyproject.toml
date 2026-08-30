@@ -9,6 +9,7 @@ description = "A resource-bounded, local-first foundation for temporal capture a
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = []
+authors = [{ name = "Carlos Acosta" }]
 keywords = ["computer-vision", "local-first", "resource-bounded"]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
@@ -20,6 +21,12 @@ classifiers = [
 
 [project.scripts]
 viskium = "viskium.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/charle-z/viskium"
+Repository = "https://github.com/charle-z/viskium"
+Issues = "https://github.com/charle-z/viskium/issues"
+Security = "https://github.com/charle-z/viskium/security/advisories"
 
 [tool.hatch.version]
 path = "src/viskium/_version.py"
