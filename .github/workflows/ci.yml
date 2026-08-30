@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Python 3.13 / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.12.7"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Sync locked development environment
+        run: uv sync --locked --group dev
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Type-check
+        run: uv run mypy
+
+      - name: Test
+        run: uv run pytest
+
+      - name: Build wheel and source distribution
+        run: uv run python -m build --no-isolation --outdir dist
+
+      - name: Create isolated wheel environment
+        run: uv venv .wheel-venv --python 3.13
+
+      - name: Install built wheel
+        run: >-
+          uv run python -c
+          "import os, pathlib, subprocess;
+          wheel = next(pathlib.Path('dist').glob('*.whl'));
+          executable = pathlib.Path('.wheel-venv') / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python');
+          subprocess.check_call(['uv', 'pip', 'install', '--python', str(executable), str(wheel)])"
+
+      - name: Smoke-test installed wheel (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          .wheel-venv/bin/python -I -c "import viskium; assert viskium.__version__ == '0.1.0'"
+          .wheel-venv/bin/viskium --version
+          .wheel-venv/bin/viskium doctor --json
+          .wheel-venv/bin/viskium config show --effective --json
+          .wheel-venv/bin/viskium replay --mode exhaustive --frames 5 --json
+          .wheel-venv/bin/viskium replay --mode faithful --frames 5 --json
+
+      - name: Smoke-test installed wheel (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          .wheel-venv\Scripts\python.exe -I -c "import viskium; assert viskium.__version__ == '0.1.0'"
+          .wheel-venv\Scripts\viskium.exe --version
+          .wheel-venv\Scripts\viskium.exe doctor --json
+          .wheel-venv\Scripts\viskium.exe config show --effective --json
+          .wheel-venv\Scripts\viskium.exe replay --mode exhaustive --frames 5 --json
+          .wheel-venv\Scripts\viskium.exe replay --mode faithful --frames 5 --json

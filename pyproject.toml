@@ -1,0 +1,123 @@
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "viskium"
+dynamic = ["version"]
+description = "A resource-bounded, local-first foundation for temporal capture and structured observations."
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = []
+keywords = ["computer-vision", "local-first", "resource-bounded"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+
+[project.scripts]
+viskium = "viskium.cli:main"
+
+[tool.hatch.version]
+path = "src/viskium/_version.py"
+
+[dependency-groups]
+dev = [
+  "build>=1.2,<2",
+  "hatchling==1.32.0",
+  "hypothesis>=6.130,<7",
+  "mypy>=1.16,<2",
+  "pytest>=8.3,<10",
+  "pytest-cov>=6,<8",
+  "ruff>=0.12,<1",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/.python-version",
+  "/src/viskium",
+  "/tests",
+  "/docs",
+  "/README.md",
+  "/CONTRIBUTING.md",
+  "/SECURITY.md",
+  "/uv.lock",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/viskium"]
+
+[tool.uv]
+required-version = "==0.12.7"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = [".uv-cache", ".venv", ".wheel-venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = [
+  "B",
+  "C4",
+  "E4",
+  "E7",
+  "E9",
+  "F",
+  "I",
+  "PIE",
+  "PT",
+  "RUF",
+  "SIM",
+  "UP",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["viskium"]
+
+[tool.ruff.format]
+docstring-code-format = true
+line-ending = "lf"
+
+[tool.mypy]
+python_version = "3.13"
+files = ["src/viskium"]
+strict = true
+pretty = true
+show_error_codes = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+minversion = "8.3"
+testpaths = ["tests"]
+addopts = [
+  "-ra",
+  "--strict-config",
+  "--strict-markers",
+  "--cov=viskium",
+  "--cov-branch",
+  "--cov-report=term-missing:skip-covered",
+  "--cov-fail-under=90",
+  "-m",
+  "not hardware",
+]
+xfail_strict = true
+markers = [
+  "hardware: requires explicitly authorized physical hardware access",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["viskium"]
+
+[tool.coverage.report]
+fail_under = 90
+precision = 1
+show_missing = true
+skip_covered = true
+exclude_also = [
+  "if TYPE_CHECKING:",
+]
