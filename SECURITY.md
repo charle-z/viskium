@@ -44,9 +44,7 @@ bugs normales, pero un agotamiento reproducible y no acotado sí pertenece a est
 Permite que el equipo confirme el alcance y prepare una corrección antes de publicar detalles.
 No se ofrecen recompensas ni plazos de respuesta en esta fase.
 
-## Estado de licencia
+## Licencia
 
-El repositorio todavía no tiene una licencia de software adoptada. Su visibilidad pública no
-autoriza automáticamente el uso, modificación o redistribución del código. La política de
-licencia y contribución debe resolverse antes de aceptar contribuciones externas. Este aviso no
-constituye asesoría legal.
+El código y la documentación del repositorio se distribuyen bajo Apache License 2.0; consulta
+[LICENSE](LICENSE). La licencia no modifica este proceso de divulgación responsable.

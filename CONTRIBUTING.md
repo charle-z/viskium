@@ -1,15 +1,16 @@
 # Contribuir a Viskium
 
 Viskium se desarrolla mediante cortes verticales pequeños, reproducibles y medibles. Antes de
-cambiar código, lee la [constitución de ingeniería](docs/engineering-constitution.md) y el
-[plan maestro](docs/plans/master-plan.md).
+cambiar código, lee la [constitución de ingeniería](docs/engineering-constitution.md), la
+[arquitectura](docs/architecture/overview.md) y la
+[política de recursos y datos](docs/architecture/resource-and-data-policy.md).
 
-## Estado de licencia y contribuciones externas
+## Licencia y contribuciones
 
-El proyecto todavía no ha adoptado una licencia de software. Que el repositorio sea visible
-públicamente no concede por sí solo derechos de uso, modificación o redistribución. Hasta que
-se publique una licencia y una política de contribución, no se deben fusionar contribuciones
-externas. Este aviso no constituye asesoría legal.
+El proyecto se distribuye bajo Apache License 2.0. Salvo que se indique explícitamente lo
+contrario, una contribución enviada intencionalmente para incluirse en Viskium se ofrece bajo los
+mismos términos, conforme a la sección 5 de [LICENSE](LICENSE). Quien contribuye debe tener los
+derechos necesarios sobre el material enviado.
 
 ## Preparar el entorno
 

@@ -45,6 +45,9 @@ benchmarks/results/
 *.log
 *.dmp
 
+# Private engineering plans retained only in the local working copy
+docs/plans/
+
 # Editors and operating systems
 .idea/
 .vscode/

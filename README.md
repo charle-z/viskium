@@ -28,11 +28,10 @@ abrir hardware. Los dos modos de replay operan únicamente con datos sintéticos
 El replay sintético rechaza más de 10 000 frames por ejecución para mantener acotadas CPU, RAM y
 salida; no es un límite futuro para una sesión de cámara.
 
-## Licencia actual
+## Licencia
 
-El repositorio todavía no adopta una licencia de software. Aunque sea públicamente visible, aún no
-es un proyecto open source ni concede derechos de uso, modificación o redistribución. Tampoco se
-aceptan contribuciones externas hasta resolver la licencia y la política correspondiente.
+Viskium se publica bajo la Apache License 2.0. Consulta [LICENSE](LICENSE) para los términos
+completos.
 
 ## Identidad técnica
 
@@ -52,7 +51,6 @@ La marca, la distribución, el paquete Python, los schemas y la ubicación de da
 - [Arquitectura neutral](docs/architecture/overview.md)
 - [Política de recursos y datos](docs/architecture/resource-and-data-policy.md)
 - [Resolución de la auditoría adversarial](docs/adversarial-resolution.md)
-- [Plan maestro](docs/plans/master-plan.md)
 - [ADR 0001: identidad y fundamento](docs/decisions/0001-foundation.md)
 - [Matriz de capacidades](docs/capabilities.md)
 

@@ -10,6 +10,8 @@ readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = []
 authors = [{ name = "Carlos Acosta" }]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 keywords = ["computer-vision", "local-first", "resource-bounded"]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
@@ -48,11 +50,13 @@ include = [
   "/src/viskium",
   "/tests",
   "/docs",
+  "/LICENSE",
   "/README.md",
   "/CONTRIBUTING.md",
   "/SECURITY.md",
   "/uv.lock",
 ]
+exclude = ["/docs/plans"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/viskium"]
