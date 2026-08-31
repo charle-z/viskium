@@ -111,7 +111,7 @@ def _proc_memory_snapshot() -> tuple[int | None, int | None]:  # pragma: no cove
         if len(document) <= 4_096:
             fields = document.split()
             if len(fields) >= 2:
-                sysconf: Any = os.sysconf  # type: ignore[attr-defined]
+                sysconf: Any = vars(os)["sysconf"]
                 page_size = int(sysconf("SC_PAGE_SIZE"))
                 rss_bytes = int(fields[1]) * page_size
     except (OSError, ValueError):

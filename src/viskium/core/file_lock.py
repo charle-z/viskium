@@ -9,10 +9,12 @@ creation and must provide an absolute path whose parent already exists.
 from __future__ import annotations
 
 import errno
+import importlib
 import os
 import stat
 from pathlib import Path
 from threading import Lock
+from typing import Any
 
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _REGISTRY_LOCK = Lock()
@@ -89,7 +91,7 @@ def _try_os_lock(fd: int) -> bool:
         raise OSError(errno.EINVAL, "file lease file is not a one-byte sentinel")
 
     if os.name == "nt":
-        import msvcrt
+        msvcrt: Any = importlib.import_module("msvcrt")
 
         # msvcrt.locking uses the current file position as the start of the
         # lock range. The sentinel is created exactly once above.
@@ -102,10 +104,10 @@ def _try_os_lock(fd: int) -> bool:
             raise
         return True
 
-    import fcntl
+    fcntl: Any = importlib.import_module("fcntl")
 
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as error:
         if error.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK, errno.EDEADLK}:
             return False
