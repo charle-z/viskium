@@ -109,19 +109,25 @@ def _bounded_blob(
     maximum: int,
     exact: int | None = None,
 ) -> bytes:
+    def validate_size(size: int) -> None:
+        if exact is not None and size != exact:
+            raise ValueError(f"{name} has an invalid length")
+        if size > maximum:
+            raise ValueError(f"{name} exceeds its byte ceiling")
+
     if type(value) is memoryview:
-        size = value.nbytes
-    elif type(value) in {bytes, bytearray}:
-        size = len(value)
-    else:
-        raise TypeError(f"{name} must be a SQLite blob")
-    if exact is not None and size != exact:
-        raise ValueError(f"{name} has an invalid length")
-    if size > maximum:
-        raise ValueError(f"{name} exceeds its byte ceiling")
-    if type(value) is memoryview:
-        return value.tobytes()
-    return bytes(value)
+        view = cast(memoryview, value)
+        validate_size(view.nbytes)
+        return view.tobytes()
+    if type(value) is bytes:
+        immutable = value
+        validate_size(len(immutable))
+        return immutable
+    if type(value) is bytearray:
+        mutable = value
+        validate_size(len(mutable))
+        return bytes(mutable)
+    raise TypeError(f"{name} must be a SQLite blob")
 
 
 def _bounded_text(value: object, name: str, *, maximum: int) -> str:
