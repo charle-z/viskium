@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+.tmp-*/
 .hypothesis/
 .mypy_cache/
 .ruff_cache/
@@ -11,6 +12,7 @@ __pycache__/
 # Environments
 .venv/
 .wheel-venv/
+.extras-wheel-venv/
 venv/
 env/
 

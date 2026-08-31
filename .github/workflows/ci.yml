@@ -38,7 +38,7 @@ jobs:
         run: uv python install 3.13
 
       - name: Sync locked development environment
-        run: uv sync --locked --group dev
+        run: uv sync --locked --group dev --extra agent --extra camera
 
       - name: Check formatting
         run: uv run ruff format --check .
@@ -55,16 +55,52 @@ jobs:
       - name: Build wheel and source distribution
         run: uv run python -m build --no-isolation --outdir dist
 
+      - name: Verify source distribution contents
+        run: >-
+          uv run python -c
+          'import pathlib, tarfile;
+          archive = next(pathlib.Path("dist").glob("*.tar.gz"));
+          names = tarfile.open(archive, "r:gz").getnames();
+          relative = {name.split("/", 1)[1] for name in names if "/" in name};
+          required = {"scripts/viskium_mcp_launcher.py", ".agents/skills/operate-viskium/SKILL.md", ".codex/config.toml"};
+          assert required <= relative;
+          assert not any("/docs/plans/" in f"/{name}" for name in names)'
+
+      - name: Test launcher from extracted source distribution
+        run: >-
+          uv run python -c
+          'import pathlib, subprocess, sys, tarfile;
+          archive = next(pathlib.Path("dist").glob("*.tar.gz"));
+          target = pathlib.Path("dist/sdist-smoke");
+          target.mkdir();
+          bundle = tarfile.open(archive, "r:gz");
+          bundle.extractall(target, filter="data");
+          bundle.close();
+          test = next(target.glob("*/tests/unit/test_mcp_launcher.py"));
+          subprocess.check_call([sys.executable, "-m", "pytest", str(test), "-q", "--no-cov", "-p", "no:cacheprovider", "--basetemp", str(target / "pytest-temp")])'
+
       - name: Create isolated wheel environment
         run: uv venv .wheel-venv --python 3.13
 
       - name: Install built wheel
         run: >-
           uv run python -c
-          "import os, pathlib, subprocess;
-          wheel = next(pathlib.Path('dist').glob('*.whl'));
-          executable = pathlib.Path('.wheel-venv') / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python');
-          subprocess.check_call(['uv', 'pip', 'install', '--python', str(executable), str(wheel)])"
+          'import os, pathlib, subprocess;
+          wheel = next(pathlib.Path("dist").glob("*.whl"));
+          executable = pathlib.Path(".wheel-venv") / ("Scripts/python.exe" if os.name == "nt" else "bin/python");
+          subprocess.check_call(["uv", "pip", "install", "--python", str(executable), str(wheel)])'
+
+      - name: Install built wheel with optional runtime extras
+        run: >-
+          uv run python -c
+          'import os, pathlib, subprocess;
+          wheel = next(pathlib.Path("dist").glob("*.whl")).resolve();
+          environment = pathlib.Path(".extras-wheel-venv");
+          subprocess.check_call(["uv", "venv", str(environment), "--python", "3.13"]);
+          executable = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python");
+          subprocess.check_call(["uv", "pip", "install", "--python", str(executable), f"{wheel}[agent,camera]"]);
+          code = "import importlib.metadata as metadata; import cv2; from viskium.agent.mcp_server import _load_mcp_bindings; assert metadata.version(\"mcp\") == \"2.1.1\"; _load_mcp_bindings()";
+          subprocess.check_call([str(executable), "-I", "-c", code])'
 
       - name: Smoke-test installed wheel (Unix)
         if: runner.os != 'Windows'
@@ -75,6 +111,9 @@ jobs:
           .wheel-venv/bin/viskium config show --effective --json
           .wheel-venv/bin/viskium replay --mode exhaustive --frames 5 --json
           .wheel-venv/bin/viskium replay --mode faithful --frames 5 --json
+          .wheel-venv/bin/viskium storage --help
+          .wheel-venv/bin/viskium consent --help
+          .wheel-venv/bin/viskium agent serve --help
 
       - name: Smoke-test installed wheel (Windows)
         if: runner.os == 'Windows'
@@ -85,3 +124,6 @@ jobs:
           .wheel-venv\Scripts\viskium.exe config show --effective --json
           .wheel-venv\Scripts\viskium.exe replay --mode exhaustive --frames 5 --json
           .wheel-venv\Scripts\viskium.exe replay --mode faithful --frames 5 --json
+          .wheel-venv\Scripts\viskium.exe storage --help
+          .wheel-venv\Scripts\viskium.exe consent --help
+          .wheel-venv\Scripts\viskium.exe agent serve --help

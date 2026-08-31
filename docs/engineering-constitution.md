@@ -13,7 +13,7 @@ Viskium comenzará pequeño, pero cada parte que entre al camino de ejecución t
 1. **Núcleo neutral.** No se incorporan todavía conceptos como mundo, creencia, relación, planificación, acción o identidad. Aparecerán únicamente cuando un escenario de producto los exija.
 2. **Monolito modular.** Un proceso y una instalación antes que microservicios, brokers o protocolos distribuidos.
 3. **Determinismo primero.** La primera ruta funcional utiliza fuentes sintéticas y replay, no una cámara ni un modelo real.
-4. **Frescura en vivo, exhaustividad en laboratorio.** Live puede descartar trabajo obsoleto; replay exhaustive no. Replay faithful reproduce los descartes y deadlines del modo live.
+4. **Frescura en vivo, exhaustividad en laboratorio.** Live puede descartar trabajo obsoleto; replay exhaustive no. Replay faithful simula el reemplazo latest-only sobre timestamps sintéticos, pero no afirma reproducir todos los deadlines, reconexiones o fallos del modo live.
 5. **Ownership exclusivo.** Cámara, buffers, processor, conexión de escritura y snapshot visible tienen un único propietario.
 6. **Todo está acotado.** Colas, caches, buffers, lotes, archivos, logs, payloads y retención tienen límites por cantidad y por bytes.
 7. **Persistencia selectiva.** Frames, tensores, masks y crops son efímeros. Las observaciones estructuradas pueden persistir bajo clasificación, TTL y cuota.

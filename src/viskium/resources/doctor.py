@@ -5,12 +5,14 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import sqlite3
 import stat
 import sys
 from pathlib import Path
 from typing import Any
 
 from viskium.config import EffectiveConfig
+from viskium.storage.layout import DATA_ROOT_MARKER, StorageLayoutError, verify_data_root
 
 
 def _nearest_existing_directory(path: Path) -> Path | None:
@@ -79,6 +81,28 @@ def build_doctor_report(config: EffectiveConfig) -> dict[str, Any]:
         is_directory = stat.S_ISDIR(path_stat.st_mode)
 
     disk = _disk_report(data_root)
+    layout_report: dict[str, Any] = {
+        "inspection_mode": "read_only",
+        "initialized": False,
+        "valid": None,
+        "reason": "data_root_missing" if not exists else None,
+    }
+    if exists and is_directory:
+        try:
+            marker_exists = (data_root / DATA_ROOT_MARKER).is_file()
+        except OSError:
+            marker_exists = False
+            layout_report.update(valid=False, reason="marker_inspection_failed")
+        else:
+            if not marker_exists:
+                layout_report.update(valid=False, reason="marker_missing")
+            else:
+                try:
+                    verify_data_root(data_root)
+                except StorageLayoutError:
+                    layout_report.update(initialized=True, valid=False, reason="invalid_layout")
+                else:
+                    layout_report.update(initialized=True, valid=True, reason=None)
     issues: list[dict[str, str]] = []
     if inspection_error is not None:
         issues.append(
@@ -104,6 +128,20 @@ def build_doctor_report(config: EffectiveConfig) -> dict[str, Any]:
                 "message": "The effective data root does not exist; doctor left it unchanged.",
             }
         )
+    elif is_directory and layout_report["valid"] is False:
+        layout_reason = str(layout_report["reason"])
+        severity = "warning" if layout_reason == "marker_missing" else "error"
+        issues.append(
+            {
+                "severity": severity,
+                "code": "data_root_not_initialized"
+                if layout_reason == "marker_missing"
+                else "data_root_layout_invalid",
+                "message": "The effective data root is not initialized for Viskium."
+                if layout_reason == "marker_missing"
+                else "The initialized Viskium data-root layout failed validation.",
+            }
+        )
     if not disk["available"]:
         issues.append(
             {
@@ -124,6 +162,12 @@ def build_doctor_report(config: EffectiveConfig) -> dict[str, Any]:
         "schema_version": 1,
         "status": status,
         "read_only": True,
+        "sqlite_runtime_version": sqlite3.sqlite_version,
+        "storage_policy": {
+            "desired_journal_mode": "DELETE",
+            "wal_enabled": False,
+            "automatic_vacuum": False,
+        },
         "python": {
             "version": platform.python_version(),
             "implementation": platform.python_implementation(),
@@ -140,6 +184,8 @@ def build_doctor_report(config: EffectiveConfig) -> dict[str, Any]:
             "source": config.storage.root_source,
             "exists": exists,
             "is_directory": is_directory,
+            "read_only": True,
+            "layout": layout_report,
             "disk": disk,
         },
         "config": {

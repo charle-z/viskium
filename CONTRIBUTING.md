@@ -19,7 +19,7 @@ reproducible de dependencias y debe permanecer versionado.
 
 ```console
 uv python install 3.13
-uv sync --locked --group dev
+uv sync --locked --group dev --extra agent --extra camera
 ```
 
 Solo quien cambie deliberadamente las dependencias debe regenerar el lock con `uv lock` y
@@ -58,7 +58,7 @@ artefactos salvo que exista una política explícita y consentimiento verificabl
 
 ## Dependencias y artefactos
 
-- La aplicación no tiene dependencias de runtime en la fase fundacional.
+- El paquete base no tiene dependencias de runtime; MCP y OpenCV son extras independientes.
 - Toda dependencia nueva necesita consumidor inmediato y revisión de licencia y procedencia.
 - Los modelos y datasets requieren checksum, fuente, licencia y contrato de entrada/salida.
 - Nunca subas secretos, capturas privadas, bases de datos operativas o resultados locales.

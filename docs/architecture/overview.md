@@ -1,186 +1,189 @@
-# Arquitectura neutral
+# Arquitectura implementada
 
-Estado: `accepted` para infraestructura; el dominio del producto permanece bloqueado por escenarios.
+Estado: `accepted` para los slices fundacionales. El dominio del producto, un processor real y una
+vista semántica permanecen bloqueados por escenarios. Ningún componente está desplegado.
 
-## Vista general
+## Qué existe hoy
+
+Viskium contiene dos caminos relacionados, pero todavía no una única aplicación continua de visión:
+
+1. Un slice live de librería: captura latest-only, un processor, publicación de la observación más
+   reciente y persistencia opcional acotada.
+2. Un prototipo local para agentes: status, lectura de una observación ya disponible y un snapshot
+   de cámara one-shot bajo consentimiento.
 
 ```mermaid
 flowchart LR
-    CR[Composition root] --> RT[Session runtime]
-    RT --> SRC[Frame source]
-    SRC --> SLOT[Latest frame slot]
-    SLOT --> ADM[Admission policy]
-    ADM --> PROC[Processor]
-    PROC --> OBS[Observation envelope]
-    OBS --> VIEW[Live view sink]
-    OBS --> COAL[Coalescer]
-    COAL --> STORE[Bounded observation store]
-    RT --> CLOCK[Clock]
-    RT --> SAMPLE[Resource sampler]
-    SAMPLE --> BUDGET[Budget policy]
-    BUDGET --> ADM
-    BUDGET --> STORE
+    subgraph LIVE["Slice live de librería"]
+        BF[CaptureBackend factory] --> CC[CameraController]
+        CC --> LF[LatestFrameSlot cap=1]
+        LF --> LS[LiveScheduler]
+        PROC[Processor] --> LS
+        ADM1[AdmissionGate] --> LS
+        LS --> LO[LatestObservationSlot cap=1]
+        LS -. persistencia opcional .-> OW[ObservationWriter]
+        OW --> STORE[ObservationStore / SQLiteStore]
+    end
+
+    subgraph AGENT["Aplicación local para agentes"]
+        CONSENT[ConsentLedger] --> READ[AgentReadService]
+        ALO[LatestObservationSlot cap=1] --> READ
+        READ --> MCP[MCP stdio opcional]
+        READ --> CSP[CameraSnapshotProvider]
+        ADM2[ResourceAdmissionGate] --> CSP
+        CSP --> OCV[OpenCVProcessCameraBackend]
+        OCV --> CHILD[Proceso hijo OpenCV]
+        CSP --> PNG[PNG efímero en memoria]
+    end
 ```
 
-El núcleo no conoce OpenCV, ONNX Runtime, SQLite ni una UI. Los adapters implementan puertos; el composition root los conecta manualmente.
+`build_agent_application()` compone el segundo camino sin abrir la cámara. Su
+`LatestObservationSlot` no tiene actualmente un productor conectado: `agent serve` puede exponer
+status y snapshots one-shot, pero no inicia `CameraController`, `LiveScheduler`, un processor ni
+SQLite. Integrar ambos caminos exige un composition root adicional y pruebas E2E.
 
 ## Componentes y ownership
 
-| Componente | Responsabilidad exclusiva |
+| Componente | Responsabilidad y límite de ownership |
 |---|---|
-| `SessionRuntime` | Lifecycle, admisión y shutdown coordinado |
-| `FrameSource` | Producir frames con tiempo y época |
-| `CameraController` futuro | Handle de cámara y negociación del stream |
-| `FrameBufferPool` | Buffers propiedad de Viskium |
-| `ProcessorWorker` | Processor o sesión de inferencia |
-| `ObservationWriter` | Conexión de escritura del store |
-| `LiveViewSink` | Snapshot visible más reciente |
-| `ResourceSampler` | Medición read-only del host y proceso |
-| `BudgetPolicy` | Decisiones puras de perfil y admisión |
+| `CameraController` | Crea, abre, lee y cierra un backend en un único daemon thread. Nunca crea el siguiente backend antes de que cierre el anterior. |
+| `CaptureBackend` | Negocia un stream y devuelve resultados tipados dentro de deadlines. El acceso pertenece a un solo thread. |
+| `OpenCVProcessCameraBackend` | Aloja OpenCV y el handle físico en un proceso hijo. Ante timeout termina ese worker antes de reutilizar el backend. |
+| `LatestFrameSlot` | Retiene como máximo un `FrameEnvelope`; un offer nuevo reemplaza el pendiente y `close()` lo descarta. |
+| `LiveScheduler` | Posee un processor worker, valida frescura/epoch/identidad y publica como máximo la última observación. |
+| `LatestObservationSlot` | Retiene una observación estructurada, con reads acotados por edad, espera y schemas; no conserva historial para buscar una coincidencia anterior. |
+| `ObservationWriter` | Crea, usa y cierra un store en un único daemon thread; su cola está limitada por count y bytes canónicos. |
+| `SQLiteStore` | Pertenece a un thread, usa journal `DELETE` y aplica límites de filas, payload, DB, queries y purga. |
+| `ResourceSampler` | Mide RSS, memoria disponible y espacio del volumen sin escribir ni tomar decisiones. |
+| `BudgetPolicy` | Produce decisiones puras de captura, procesamiento y persistencia. |
+| `ResourceAdmissionGate` | Cachea brevemente solo el snapshot de recursos y reaplica cada estimación de bytes. |
+| `ConsentLedger` | Persiste el grant local y su cuota sin guardar bearer tokens ni abrir hardware. |
+| `AgentReadService` | Autoriza y acota status, una observación latest o un snapshot; revalida el grant después de esperar/capturar. |
+| `CameraSnapshotProvider` | Serializa una operación one-shot: admission, open, warmup/read, PNG en RAM y close. No cachea frames ni resultados. |
+| Transporte MCP | Adapta tres operaciones versionadas; no concede permisos, no transmite video y no controla el lifecycle de cámara. |
 
-El processor no modifica cámara, UI o almacenamiento. La UI no abre la cámara. El sampler no degrada componentes por sí mismo.
+El processor no modifica cámara, consentimiento o almacenamiento. El sampler no degrada componentes
+por sí mismo. El servicio para agentes no crea ni renueva grants.
 
-## Contratos mínimos
+## Contratos implementados
 
 ### `FrameEnvelope`
 
 ```text
-source_id
-stream_epoch
-sequence
-source_timestamp opcional
-received_monotonic_ns
-timestamp_quality
-width / height
-pixel_format / stride
-buffer_id / generation
-quality_flags
-payload efímero no serializable
+source_id / stream_epoch / sequence
+received_monotonic_ns / source_timestamp_ns opcional / timestamp_quality
+width / height / pixel_format / stride
+buffer_id / generation / quality_flags
+payload efímero como bytes inmutables
 ```
 
-`stream_epoch` cambia después de reconexión, cambio de modo o reanudación. Un payload que sobrevive al frame se copia como ROI o tensor compacto; una view no puede escapar del lease.
-
-### `ProcessingRequest`
-
-```text
-request_id
-processor_id / processor_version
-source_id / stream_epoch / frame_sequence
-created_monotonic_ns
-deadline_monotonic_ns opcional
-priority
-supersedes_key opcional
-roi opcional
-config_fingerprint
-```
+La implementación actual copia el frame a `bytes`; no existe todavía un buffer pool ni un contrato de
+leases. El payload puede estar en el stack de captura, en un slot de capacidad uno o durante una
+operación one-shot, y no forma parte de la serialización de observaciones.
 
 ### `ObservationEnvelope`
 
 ```text
-session_id
-source_id / stream_epoch / source_sequence
-observed_monotonic_ns
-wall_utc opcional
+session_id / source_id / stream_epoch / source_sequence
+observed_monotonic_ns / wall_utc opcional
 producer_id / producer_version
 schema_id / schema_version
-payload validado y limitado
-quality o confidence opcional
-provenance
-sensitivity_class
-persistence_class
-ttl
-idempotency_key
-trace_id
+payload JSON-shaped copiado y congelado en profundidad
+confidence / provenance
+sensitivity_class / persistence_class / ttl_ns
+idempotency_key / trace_id
 ```
 
-No admite frames, tensores, masks ni blobs arbitrarios. `unknown`, `absent` y `false` son estados distintos.
+El payload admite solo valores JSON acotados, enteros signed 64-bit y floats finitos. No admite frames,
+tensores, masks ni blobs arbitrarios. `prohibited` nunca se publica por el scheduler ni se persiste;
+`visual` no se admite en SQLite.
 
 ### `PersistenceReceipt`
 
 ```text
 accepted | coalesced | rejected | gap | failed
-reason
+reason opcional
 store_sequence opcional
 bytes_accepted
 ```
 
-### `HealthEvent`
+Una submission al writer significa `queued`, no durabilidad. La durabilidad solo se refleja cuando el
+store devuelve su receipt. El límite de bytes del writer usa tamaño canónico, no RSS exacto, y una
+observación ya `in_flight` se reporta fuera de la cola.
+
+### Captura y snapshot
+
+`CaptureRequest`, `CameraPolicy`, `CaptureCapabilities`, `NegotiatedStream`, `BackendFrame` y
+`CaptureRead` forman un contrato tipado y acotado. `SnapshotEnvelope` contiene únicamente PNG
+inmutable, dimensiones, procedencia mínima y sensitivity class; no contiene metadatos de cámara
+adicionales ni se escribe automáticamente.
+
+### Agente local
+
+`ConsentGrant` solo contiene id público, scopes, expiración, cuota y sensitivity ceiling. Los límites
+de requests, metadata, observaciones, PNG, borde, espera, edad y schemas se publican en
+`AgentLimits`. Ninguna credencial aparece en inputs o resultados model-visible.
+
+## Concurrencia y backpressure
 
 ```text
-component
-state
-reason_code
-first_seen / last_seen
-count
-recoverable
-user_action opcional
+CameraController owner thread
+    ↓ offer no bloqueante
+LatestFrameSlot (1)
+    ↓ take acotado
+LiveScheduler processor thread
+    ↓ offer latest-only
+LatestObservationSlot (1)
+    ↓ submit opcional no bloqueante
+ObservationWriter queue (count + bytes)
+    ↓ un owner thread
+ObservationStore / SQLiteStore
 ```
 
-Los errores repetidos se agregan; no producen un evento en disco por frame.
+- No hay colas ilimitadas.
+- Solo hay una llamada al processor por scheduler.
+- Los frames pendientes obsoletos se reemplazan en vez de acumularse.
+- El scheduler rechaza frames futuros, viejos o de otra epoch y resultados tardíos o con identidad
+  incoherente.
+- Un processor nativo no cooperativo no puede terminarse con seguridad desde un thread; el shutdown
+  acotado deja el scheduler en `STUCK`.
+- El backend OpenCV usa un proceso precisamente para poder terminar open/read que excedan su
+  deadline; falta demostrarlo con hardware real.
+- El writer puede drenar o descartar explícitamente al cerrar; si `put()` no coopera, queda `STUCK`.
 
-## Concurrencia inicial
-
-```text
-capture thread
-    ↓
-latest-frame slot
-    ↓
-runtime coordinator
-    ↓
-one processor worker
-    ↓
-bounded observation queue
-    ↓
-one store writer
-```
-
-- Un proceso inicialmente.
-- Una inferencia pesada en vuelo.
-- Threads antes que procesos.
-- `asyncio` solo cuando aparezca I/O concurrente real.
-- Ninguna cola ilimitada; límite por count y bytes.
-- Los trabajos pendientes pueden fusionarse o expirar.
-- Un trabajo nativo ya iniciado puede ser no cancelable; su resultado se valida al volver.
-- Captura se aísla en otro proceso solo si una prueba demuestra que `read()` no termina dentro del deadline.
-
-## Validez temporal
-
-Una inferencia tardía no se acepta o rechaza únicamente por `state_revision`. Se evalúan:
-
-- `stream_epoch`.
-- Secuencia y momento de captura.
-- Deadline y edad.
-- Entidad o campo afectado.
-- Evidencia posterior contradictoria.
-- Posibilidad de fusionar el resultado sin retroceder estado.
-
-La revisión sirve como procedencia. Esto evita que un processor lento trabaje para que todos sus resultados sean descartados automáticamente.
+El camino one-shot no usa una cola: un lock no bloqueante rechaza concurrencia como `busy`, un
+cooldown evita reaperturas rápidas y una sola deadline cubre open, warmup, reads y encoding.
 
 ## Modos de ejecución
 
-### Live
+### Live de librería
 
-- Latest-frame y frescura prioritaria.
-- Backpressure y drops contabilizados.
-- Heartbeat aun si el gate barato no detecta cambios.
-- Estado `STALE` al superar TTL.
+Prioriza frescura mediante latest-only, deadlines, epoch y backpressure. Está validado con fuentes y
+processors falsos, pero aún no tiene un composition root continuo público ni hardware caracterizado.
 
 ### Replay exhaustive
 
-- Procesa todas las entradas.
-- Reloj virtual y seeds fijadas.
-- Referencia algorítmica.
+Procesa todas las entradas con reloj virtual y resultados deterministas.
 
-### Replay faithful
+### Replay faithful sintético
 
-- Reproduce timestamps, jitter, reconexiones, drops, deadlines y decisiones de admisión.
-- Referencia operacional del modo live.
+Reproduce la política latest-only sobre timestamps sintéticos. No afirma todavía paridad completa con
+jitter, drivers o reconexiones de una cámara física.
 
-Los modos comparten contratos y processor, no necesariamente clock o admission policy.
+### Agente one-shot
 
-## Estructura objetivo
+El transporte MCP opcional expone exactamente:
 
-Se crean carpetas solo al aparecer su primera implementación real.
+- `viskium_status_v1`: status público acotado, sin consentimiento ni hardware.
+- `viskium_latest_observation_v1`: como máximo una observación bajo grant existente.
+- `viskium_snapshot_v1`: como máximo un PNG one-shot bajo grant y cuota existentes.
+
+No existe tool para conceder acceso, abrir una sesión continua, mover una cámara o guardar imágenes.
+Un smoke local 640×480 atravesó grant, admission, cliente MCP in-memory y cierre del worker en una
+cámara Windows. Sigue faltando caracterización multi-dispositivo, unplug/busy/sleep-resume y cliente
+stdio externo con hardware.
+
+## Estructura actual
 
 ```text
 src/viskium/
@@ -189,13 +192,13 @@ src/viskium/
 ├── config.py
 ├── paths.py
 ├── core/
-├── runtime/
 ├── capture/
-├── processing/
+├── runtime/
 ├── observations/
+├── snapshots/
 ├── storage/
 ├── resources/
-├── observability/
+├── agent/
 └── adapters/
 
 tests/
@@ -203,10 +206,8 @@ tests/
 ├── property/
 ├── contract/
 ├── replay/
-├── integration/
-├── faults/
-├── perf/
-└── hardware/
+└── integration/
 ```
 
-No habrá inicialmente módulos `belief`, `world`, `graph`, `planner`, `agents` o `dynamics`.
+No existen todavía módulos de producto como `belief`, `world`, `graph`, `planner` o `dynamics`.
+Tampoco existen un processor de visión real, UI semántica, fuente telefónica o servicio desplegado.

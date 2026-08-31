@@ -15,11 +15,20 @@ license-files = ["LICENSE"]
 keywords = ["computer-vision", "local-first", "resource-bounded"]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
-  "Operating System :: OS Independent",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.13",
   "Typing :: Typed",
 ]
+
+[project.optional-dependencies]
+agent = [
+  "anyio>=4.5,<5",
+  "mcp==2.1.1",
+  "pydantic>=2.11,<3",
+]
+camera = ["opencv-python-headless>=5,<6"]
 
 [project.scripts]
 viskium = "viskium.cli:main"
@@ -46,7 +55,10 @@ dev = [
 
 [tool.hatch.build.targets.sdist]
 include = [
+  "/.agents",
+  "/.codex",
   "/.python-version",
+  "/scripts",
   "/src/viskium",
   "/tests",
   "/docs",
@@ -68,7 +80,14 @@ required-version = "==0.12.7"
 target-version = "py313"
 line-length = 100
 src = ["src", "tests"]
-extend-exclude = [".uv-cache", ".venv", ".wheel-venv", "build", "dist"]
+extend-exclude = [
+  ".extras-wheel-venv",
+  ".uv-cache",
+  ".venv",
+  ".wheel-venv",
+  "build",
+  "dist",
+]
 
 [tool.ruff.lint]
 select = [

@@ -34,6 +34,54 @@ def _observation(sequence: int = 0) -> ObservationEnvelope:
     return DeterministicProcessor().process(_frame(sequence=sequence), session_id="test-session")
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"stream_epoch": 2**63},
+        {"sequence": 2**63},
+        {"received_monotonic_ns": 2**63},
+        {"source_timestamp_ns": 2**63},
+        {"width": 2**63, "height": 1},
+        {"height": 2**63, "width": 1},
+        {"stride": 2**63},
+        {"generation": 2**63},
+    ],
+)
+def test_frame_integer_fields_reject_signed_64_bit_overflow(overrides: dict[str, Any]) -> None:
+    with pytest.raises(ValueError, match="signed 64 bits"):
+        _frame(**overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"stream_epoch": 2**63},
+        {"source_sequence": 2**63},
+        {"observed_monotonic_ns": 2**63},
+        {"schema_version": 2**63},
+        {"ttl_ns": 2**63},
+    ],
+)
+def test_observation_integer_fields_reject_signed_64_bit_overflow(
+    overrides: dict[str, Any],
+) -> None:
+    with pytest.raises(ValueError, match="signed 64 bits"):
+        replace(_observation(), **overrides)
+
+
+@pytest.mark.parametrize("field_name", ["store_sequence", "bytes_accepted"])
+def test_receipt_integer_fields_reject_signed_64_bit_overflow(field_name: str) -> None:
+    values: dict[str, Any] = {"status": "accepted", field_name: 2**63}
+    with pytest.raises(ValueError, match="signed 64 bits"):
+        PersistenceReceipt(**values)
+
+
+@pytest.mark.parametrize("reason", ["", " ", "x" * 129, object()])
+def test_persistence_receipt_reason_is_bounded(reason: object) -> None:
+    with pytest.raises((TypeError, ValueError), match="reason"):
+        PersistenceReceipt(status="failed", reason=reason)  # type: ignore[arg-type]
+
+
 def test_contracts_are_frozen_and_payload_is_read_only() -> None:
     frame = next(SyntheticSource(1))
     observation = DeterministicProcessor().process(frame, session_id="test-session")
@@ -170,6 +218,18 @@ def test_observation_deep_freezes_payload_and_normalizes_provenance() -> None:
 def test_observation_rejects_noncanonical_numeric_payloads(value: float | int) -> None:
     with pytest.raises(ValueError, match="payload"):
         replace(_observation(), payload={"value": value})
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"text": "x" * 65_537},
+        {("k" * 250) + f"{index:06}": "x" for index in range(256)},
+    ],
+)
+def test_observation_rejects_payloads_with_excessive_total_text(payload: dict[str, str]) -> None:
+    with pytest.raises(ValueError, match="text characters"):
+        replace(_observation(), payload=payload)
 
 
 def test_observation_rejects_cycles_and_excessive_nesting() -> None:
@@ -332,7 +392,7 @@ def test_memory_store_rejects_conflict_and_unserializable_payload() -> None:
 
 
 def test_memory_store_stops_sizing_at_byte_ceiling() -> None:
-    observation = replace(_observation(), payload={"large": "x" * 100_000})
+    observation = replace(_observation(), payload={"large": "x" * 10_000})
     store = MemoryStore(max_observations=1, max_bytes=1_024)
 
     receipt = store.put(observation)

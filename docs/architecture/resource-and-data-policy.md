@@ -1,93 +1,108 @@
 # Política de recursos, datos y almacenamiento
 
-Estado: `accepted` como política; todos los números permanecen experimentales hasta calibración.
+Estado: `accepted` para los contratos implementados. Los defaults son conservadores y ajustables;
+los techos absolutos son defensas contra inputs hostiles, no objetivos de rendimiento ni prueba de
+compatibilidad con hardware.
 
-Excepción: los límites defensivos del control plane son techos de seguridad, no objetivos de
-rendimiento. La base actual limita cada TOML a 1 MiB, el replay sintético a 10 000 frames y cada
-payload de observación a 32 niveles y 4 096 valores JSON. Los enteros del payload son signed 64-bit
-y los floats deben ser finitos. Cambiar estos contratos requiere pruebas y revisión explícita.
+## Principios vigentes
 
-## Carriles de datos
+- Un frame raw es efímero y no se serializa como observación.
+- Las observaciones estructuradas pueden permanecer solo en RAM o persistirse de forma opcional.
+- La persistencia visual está desactivada por contrato: SQLite rechaza registros declarados
+  `persistence_class="visual"`. El productor es responsable de clasificar; no existe todavía
+  detección semántica que corrija una etiqueta falsa.
+- Toda cola propia tiene límite explícito por capacidad, count o bytes.
+- Medición, decisión y enforcement permanecen separados.
+- Ningún estado `validated` autoriza afirmar desgaste cero, privacidad forense o aptitud productiva.
 
-| Carril | Contenido | Vida |
+## Carriles de datos actuales
+
+| Carril | Contenido | Retención controlada por Viskium |
 |---|---|---|
-| Hot RAM | Frames, tensors, masks, ROI y tracking inmediato | Milisegundos o segundos |
-| Estado de sesión | Observaciones recientes y coalescing | TTL corto en memoria |
-| Store semántico | Observaciones estructuradas seleccionadas | TTL + cuota |
-| Visual diagnóstico | Keyframes explícitos | Desactivado por defecto |
-| Operación | Logs y métricas agregadas | Rotación estricta |
+| Captura raw | `BackendFrame` y `FrameEnvelope` como `bytes` | Stack, IPC en memoria y `LatestFrameSlot` de capacidad uno |
+| Snapshot one-shot | Un `SnapshotEnvelope` PNG | Solo durante la llamada y su respuesta; el provider no lo cachea |
+| Estado latest | Una observación estructurada | `LatestObservationSlot` de capacidad uno hasta reemplazo o cierre |
+| Cola de escritura | Observaciones canónicas | Count y bytes configurables; 256 items y 1 MiB por defecto |
+| Store semántico | Observaciones seleccionadas con TTL | SQLite opcional, límites configurables, purga manual y recuperación vencida bajo presión |
+| Control local | Marcador del data root y grant de consentimiento | Archivos pequeños, versionados y acotados |
+| Métricas | Contadores y reason codes sin payload | RAM; no existe persistencia automática de métricas |
 
-La aplicación no persiste intencionalmente contenido visual salvo diagnóstico explícito. No se promete ausencia forense en pagefile, crash dumps, driver o compositor.
+## Frames y snapshots efímeros
 
-## Clasificación
+En captura continua, el controller conserva raw frames solo durante la llamada al backend o en el
+slot latest de capacidad uno. Reemplazar o cerrar el slot libera su referencia. El scheduler consume
+el frame y no lo incluye en la observación.
 
-Todo campo persistible declara una clase:
+El límite de un slot no equivale a “un solo frame en todo el proceso”: el driver, OpenCV, el proceso
+hijo, el canal IPC y el consumidor pueden mantener copias transitorias. La memoria real se debe medir
+con RSS y un perfil de hardware.
 
-```text
-public
-operational
-sensitive
-identifiable
-prohibited
-```
+En el camino one-shot, cada solicitud admitida crea un backend, abre, descarta warmup, lee un target,
+codifica un PNG en memoria y cierra en `finally`. El provider no guarda frame, backend ni PNG después
+de devolver. El backend OpenCV importa `cv2` en un proceso hijo y transfiere BGR por memoria; ante
+timeout intenta terminate y luego kill.
 
-OCR, nombres, presencia, horarios, ubicación, identidad y relaciones no se consideran inocuos por carecer de píxeles.
+El PNG entregado deja de estar bajo control de Viskium: un cliente MCP, el sistema operativo o una
+herramienta externa puede copiarlo o persistirlo. Tampoco se promete ausencia forense en pagefile,
+crash dumps, memoria del driver o compositor.
 
-## Modos de persistencia
+## Observaciones y persistencia opcional
 
-- `disabled`: no se escriben observaciones.
-- `best_effort_bounded`: live continúa ante fallo y genera un `persistence_gap` visible.
-- `required`: la sesión se detiene limpiamente si no puede confirmar la observación requerida.
+El comportamiento implementado es:
 
-Ningún modo bloquea indefinidamente ni acumula backlog ilimitado.
+- Sin `store` ni `writer`, `LiveScheduler` publica latest-only y cuenta `persistence_skipped`.
+- Con store directo, `put()` ocurre en el worker del scheduler.
+- Con `ObservationWriter`, `submit()` es no bloqueante y la cola rechaza al alcanzar count o bytes.
+- Un resultado `queued` no significa durabilidad; el receipt del store conserva esa distinción.
+- El modo actual es best-effort acotado. Un modo `required` que detenga la sesión por falta de
+  durabilidad aún no está implementado.
 
-## Política de escritura
+Los bytes del writer son el tamaño canónico de cada observación, no una medición del heap. El límite
+no incluye overhead de objetos Python ni la observación que ya está `in_flight`; ambas cosas se deben
+vigilar con RSS y las métricas separadas de pending/in-flight.
 
-Una observación se guarda solo si:
+Antes de persistir, el scheduler limita el tamaño canónico y consulta admission. SQLite además exige
+TTL, rechaza registros declarados `prohibited` y `visual`, aplica idempotencia y revisa sus cuotas. El consentimiento de
+lectura para agentes es una frontera distinta: no sustituye una futura política de consentimiento o
+retención para productores de observaciones sensibles.
 
-```text
-contenido permitido
-AND payload dentro de límites
-AND no absorbido por coalescing
-AND TTL y cuota válidos
-AND reserva del volumen satisfecha
-AND modo de persistencia lo permite
-```
+## SQLite implementado
 
-Se persisten transiciones, cambios significativos y heartbeats espaciados, no una fila por frame. Muestras, eventos y agregados permanecen distinguibles para no destruir evidencia sin declararlo.
+`SQLiteStore` es single-owner y usa rollback journal `DELETE`, no WAL.
 
-## SQLite inicial
+Defaults actuales:
 
-- Bases separadas para control y observaciones.
-- Una conexión propietaria por writer.
-- Journal convencional inicialmente.
-- WAL solo tras benchmark, versión aprobada y pruebas de checkpoint/readers largos.
-- Transacciones limitadas por filas, bytes y tiempo; valores salen del benchmark.
-- `max_page_count` es defensa secundaria, se aplica y verifica en cada conexión y no limita archivos auxiliares.
-- El presupuesto cuenta DB, journal o WAL/SHM, temporales, logs, keyframes y artifacts.
-- `auto_vacuum=NONE` inicialmente para reutilizar páginas y reducir reescrituras.
-- Sin `VACUUM` automático.
-- Segmentos rotables solo si operación continua demuestra que debemos devolver espacio al sistema.
-- Una DB corrupta se cierra y pone en cuarentena; nunca se borra automáticamente.
+| Límite | Default |
+|---|---:|
+| Filas | 100 000 |
+| Archivo DB mediante `max_page_count` | 192 MiB |
+| Bytes lógicos de documentos | 128 MiB |
+| Observación canónica | 64 KiB |
+| Reserva libre del volumen por write | 512 MiB |
+| `busy_timeout` | 250 ms |
+| Query | 256 filas y 1 MiB |
+| Purga manual o por presión | 512 filas por transacción |
 
-Ante `SQLITE_FULL`, `IOERR`, permisos o reserva crítica:
+Política de conexión:
 
-1. Rollback explícito si la conexión sigue en transacción.
-2. Store enclavado en `READ_ONLY`.
-3. Sin retry storm.
-4. Sin crecimiento de la cola en RAM.
-5. Gap visible o cierre de sesión según modo.
-6. Recovery únicamente con margen, histéresis y health check.
+- `journal_mode=DELETE`, `synchronous=NORMAL`, `temp_store=MEMORY`.
+- `auto_vacuum=NONE`, `secure_delete=FAST`, `mmap_size=0`.
+- Attached databases desactivadas y límites SQLite reducidos.
+- Sin `VACUUM`, retry loop, retención periódica/background ni mutación de cuarentena.
+- Query y purga manual están acotados. Solo cuando `max_rows` o
+  `max_logical_bytes` bloquearían una escritura, el mismo transaction intenta recuperar un lote
+  acotado de filas ya expiradas; nunca elimina filas frescas.
+- `SQLITE_FULL`, I/O, corrupción y errores read-only ejecutan rollback y enclavan el store en
+  `read_only`. `BUSY`/`LOCKED` falla la operación sin envenenar el store.
 
-## Paths
+`max_page_count` limita el archivo principal, no todo el conjunto físico. `footprint()` reporta DB,
+journal, WAL y SHM, pero todavía no existe un enforcer externo que sume journal, temporales, logs y
+otros artifacts bajo una cuota total. `secure_delete=FAST` tampoco es una garantía de borrado
+forense ni de menor desgaste.
 
-Identidad elegida:
+## Data root y escrituras controladas
 
-```text
-VISKIUM_DATA_ROOT
-```
-
-Precedencia prevista:
+La precedencia implementada es:
 
 ```text
 CLI explícita
@@ -96,12 +111,11 @@ CLI explícita
 → directorio local de plataforma
 ```
 
-En este equipo la candidata es `D:\ViskiumData`, pero no se crea hasta el bootstrap. La configuración pequeña puede vivir en el directorio de configuración del sistema; datos voluminosos, modelos, logs y temporales quedan bajo la raíz seleccionada.
-
-Layout previsto:
+Resolver config o ejecutar `doctor` no crea la raíz. `storage init` la inicializa explícitamente con
+un UUID, el marcador `.viskium-root.json` y estas categorías:
 
 ```text
-ViskiumData/
+data-root/
 ├── .viskium-root.json
 ├── state/
 ├── observations/
@@ -114,68 +128,92 @@ ViskiumData/
 └── quarantine/
 ```
 
-Toda limpieza verifica el marcador, la ruta absoluta, pertenencia a la raíz y política de la clase. Nunca opera sobre una raíz, home, volumen o repositorio completo.
+La verificación rechaza raíces de filesystem, home, repositorios, rutas remotas y links/reparse points
+en paths poseídos. No repara silenciosamente un layout. Mover la raíz a otra letra de unidad protege
+capacidad lógica de la unidad original, pero no prueba que sea otro dispositivo físico ni evita
+escrituras del sistema operativo fuera de la raíz.
 
-Usar `D:` protege la capacidad libre de `C:`; no prueba que reduzca desgaste si ambas letras pertenecen al mismo dispositivo físico. Tampoco puede prometerse que Windows, pagefile o librerías nativas nunca escriban fuera de la raíz controlada.
+El grant de agente se guarda en `state/agent-consent.json`, con máximo 16 KiB. Contiene id público,
+scopes, expiración, sensitivity ceiling, cuota y uso; no contiene bearer token. Las mutaciones usan
+reemplazo atómico y un lock acotado. Cada intento de snapshot reserva cuota antes de tocar el
+provider, incluso si la captura falla. Un grant dura como máximo siete días y admite como máximo
+1024 intentos de snapshot; son techos configurables hacia abajo, no defaults de consumo.
 
-## Memoria y CPU
+## Recursos y admission
 
-Gobernanza dividida:
+La gobernanza implementada se divide así:
 
-- `ResourceSampler`: mide.
-- `BudgetPolicy`: decide de forma pura.
-- Cada componente aplica localmente su límite.
+- `ResourceSampler`: obtiene RSS, memoria disponible y espacio libre mediante probes read-only.
+- `BudgetPolicy`: decide de forma pura `allow_capture`, `allow_processing` y `allow_persistence`.
+- `ResourceAdmissionGate`: cachea el snapshot de recursos 250 ms por defecto y reaplica el estimate
+  de cada solicitud.
+- Controller, scheduler, writer, store y snapshot provider aplican sus límites localmente.
 
-La admisión de un componente pesado usa:
+Un probe desconocido falla cerrado solo en la frontera afectada: memoria desconocida bloquea trabajo
+costoso; disco desconocido bloquea persistencia. Una excepción del sampler se convierte en un
+snapshot desconocido y reason codes acotados.
 
-```text
-available memory suavizada
-- reserva del sistema
-- pico p99 calibrado
-- margen de interferencia
-```
+`build_agent_application()` usa estos defaults reemplazables para un host modesto:
 
-No se fija todavía un hard limit universal. Se observan working set, private bytes/commit, memoria disponible, commit del sistema, paging, handles, threads y bytes de colas.
+| Presupuesto | Default |
+|---|---:|
+| Reserva de memoria disponible | 256 MiB |
+| Reserva de disco | 512 MiB |
+| RSS máximo del proceso | 2 GiB |
+| Cola máxima | 1 MiB / 256 items |
 
-Orden de degradación:
+El scheduler superpone `queue_bytes` y `queue_count` actuales del writer en cada decisión de
+procesamiento y persistencia. El snapshot de RAM/disco puede reutilizarse durante 250 ms, pero la
+presión de cola nunca queda congelada en ese cache. Los límites del writer siguen siendo la última
+frontera no bloqueante y usan los mismos defaults.
 
-1. No admitir trabajo nuevo costoso.
-2. Reducir frecuencia y resolución.
-3. Descartar trabajo pendiente obsoleto.
-4. Vaciar caches opcionales.
-5. Desactivar processors opcionales.
-6. Pausar inferencia si la presión continúa.
-7. Cerrar controladamente antes de OOM o paging sostenido.
+## Defaults ligeros y techos de captura
 
-## Tipos y buffers
+La solicitud pública base es 640×480 a 15 FPS con presupuesto de 1 MiB por frame. La política live
+base usa:
 
-- Píxeles: `uint8`.
-- Diferencias/acumulaciones: tipo con signo suficiente.
-- Tensor CPU baseline: `float32`.
-- INT8 solo tras bake-off E2E.
-- FP16 solo se reconsidera con otro backend/hardware.
-- Timestamps: `int64`.
-- IDs Python en dominio pequeño; arrays compactos solo en lotes densos medidos.
-- Metadatos: dataclasses con `slots`.
-- ROI view solo durante la vida del lease; después, copia compacta.
+| Control | Default |
+|---|---:|
+| Open / shutdown | 5 s / 5 s |
+| Read | 250 ms |
+| Stale | 2 s |
+| Warmup | 3 frames |
+| Reintentos de apertura | 5 |
+| Cooldown | 250 ms → 30 s |
+| Intervalo mínimo de reapertura | 1 s |
+| Reset tras stream estable | 30 s |
 
-Reducir frecuencia, resolución, copias y retención tiene prioridad sobre empaquetar objetos pequeños.
+Los guards globales permiten configurar hasta 32 MiB por frame, dimensión 8192, 240 FPS, timeout de
+60 s, cooldown de 300 s, 16 reaperturas y 300 frames de warmup. Son techos opt-in: no reservan esa
+memoria, no cambian los defaults y no afirman que OpenCV o una cámara negocien esos modos.
 
-## Métricas obligatorias
+Para el agente, los defaults son PNG de hasta 4 MiB, borde 1280 y espera de 10 s; los techos revisados
+son 8 MiB, borde 1920 y 15 s. El provider one-shot usa warmup 3, máximo 16, intervalo mínimo de open
+de 0,5 s y una lectura target por defecto; puede habilitarse exactamente un retry adicional solo ante
+error recuperable. La admisión suma un estimate reemplazable de 96 MiB para el proceso OpenCV
+(techo configurable de 4 GiB) sin reservarlo por anticipado. El límite PNG acota el resultado
+codificado, no el pico total de RAM durante
+scanlines, compresión y ensamblado.
 
-```text
-frame_age_ms
-frames received/dropped/replaced
-queue count/bytes/high-water
-processor latency p50/p95/p99
-RSS, peak RSS, private bytes y commit
-observations produced/coalesced/persisted/rejected
-persistence gaps
-DB/journal/temp/log bytes
-logical payload bytes y process write bytes
-disk free y reserve state
-commits/checkpoints/retries
-handles/threads
-```
+## Tipos y estructuras
 
-Las métricas se agregan en RAM y se persisten espaciadamente; medir no puede convertirse en la principal fuente de escrituras.
+- Frames: `bytes` inmutables; OpenCV entrega actualmente `bgr24`.
+- PNG: encoder propio para `gray8`, `rgb24` y `bgr24`, sin metadata adicional.
+- Timestamps, secuencias y contadores: rango signed 64-bit.
+- Contratos: dataclasses `frozen=True, slots=True`.
+- Payload semántico: copia profunda inmutable, máximo 32 niveles y 4096 nodos JSON-shaped.
+- Colas densas: `deque`; latest state: un único slot protegido por `Condition`.
+- No hay NumPy, tensors ni un modelo en el núcleo neutral.
+
+Reducir resolución, frecuencia, copias y retención tiene prioridad sobre micro-optimizar objetos
+Python.
+
+## Métricas disponibles y brechas
+
+Hoy existen snapshots inmutables de contadores para cámara, slots, scheduler, writer, admission,
+snapshot y servicio de agente. SQLite expone health, filas, bytes lógicos y footprint de archivos.
+Estas métricas no contienen payload ni se persisten automáticamente.
+
+Aún no existen histogramas p50/p95/p99, process-write-bytes, thermal proxy, métricas del driver ni una
+serie temporal persistente. Añadirlas requiere muestreo espaciado y cuota para que medir no se
+convierta en la principal fuente de CPU o escrituras.

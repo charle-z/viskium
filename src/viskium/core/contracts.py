@@ -16,7 +16,9 @@ type PersistenceClass = Literal["routine", "important", "diagnostic", "visual"]
 _MAX_IDENTIFIER_CHARS = 256
 _MAX_OBSERVATION_NESTING = 32
 _MAX_OBSERVATION_NODES = 4_096
+_MAX_PAYLOAD_TEXT_CHARS = 65_536
 _MAX_PROVENANCE_ENTRIES = 64
+_MAX_REASON_CHARS = 128
 _MIN_JSON_INTEGER = -(2**63)
 _MAX_JSON_INTEGER = 2**63 - 1
 
@@ -36,6 +38,8 @@ def _require_integer(value: object, field_name: str, *, minimum: int) -> None:
     if value < minimum:
         qualifier = "positive" if minimum == 1 else "non-negative"
         raise ValueError(f"{field_name} must be {qualifier}")
+    if value > _MAX_JSON_INTEGER:
+        raise ValueError(f"{field_name} must fit in signed 64 bits")
 
 
 def _normalize_string_tuple(
@@ -70,9 +74,10 @@ def _freeze_json_payload(payload: Mapping[str, Any]) -> Mapping[str, Any]:
 
     active_containers: set[int] = set()
     visited_nodes = 0
+    payload_text_chars = 0
 
     def freeze(value: Any, *, depth: int) -> Any:
-        nonlocal visited_nodes
+        nonlocal payload_text_chars, visited_nodes
         visited_nodes += 1
         if visited_nodes > _MAX_OBSERVATION_NODES:
             raise ValueError(f"payload exceeds {_MAX_OBSERVATION_NODES} structured values")
@@ -80,6 +85,12 @@ def _freeze_json_payload(payload: Mapping[str, Any]) -> Mapping[str, Any]:
             raise ValueError(f"payload exceeds {_MAX_OBSERVATION_NESTING} nesting levels")
 
         if value is None or isinstance(value, (str, bool)):
+            if isinstance(value, str):
+                payload_text_chars += len(value)
+                if payload_text_chars > _MAX_PAYLOAD_TEXT_CHARS:
+                    raise ValueError(
+                        f"payload exceeds {_MAX_PAYLOAD_TEXT_CHARS} total text characters"
+                    )
             return value
         if isinstance(value, int):
             if not _MIN_JSON_INTEGER <= value <= _MAX_JSON_INTEGER:
@@ -101,6 +112,11 @@ def _freeze_json_payload(payload: Mapping[str, Any]) -> Mapping[str, Any]:
                     if not isinstance(key, str):
                         raise TypeError("payload keys must be strings")
                     _require_non_empty(key, "payload key")
+                    payload_text_chars += len(key)
+                    if payload_text_chars > _MAX_PAYLOAD_TEXT_CHARS:
+                        raise ValueError(
+                            f"payload exceeds {_MAX_PAYLOAD_TEXT_CHARS} total text characters"
+                        )
                     frozen_mapping[key] = freeze(item, depth=depth + 1)
                 return MappingProxyType(frozen_mapping)
             finally:
@@ -271,6 +287,13 @@ class PersistenceReceipt:
             "failed",
         }:
             raise ValueError("unsupported persistence status")
+        if self.reason is not None:
+            if not isinstance(self.reason, str):
+                raise TypeError("reason must be a string when provided")
+            if not self.reason or not self.reason.strip():
+                raise ValueError("reason must not be empty")
+            if len(self.reason) > _MAX_REASON_CHARS:
+                raise ValueError(f"reason exceeds {_MAX_REASON_CHARS} characters")
         if self.store_sequence is not None:
             _require_integer(self.store_sequence, "store_sequence", minimum=1)
         _require_integer(self.bytes_accepted, "bytes_accepted", minimum=0)

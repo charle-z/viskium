@@ -1,70 +1,151 @@
 # Viskium
 
-Viskium es el nombre de trabajo y la identidad pública del proyecto. El producto final todavía no está definido; por diseño, el repositorio comienza como una base de ingeniería neutral para captura, procesamiento temporal y observaciones estructuradas locales.
+[![CI](https://github.com/charle-z/viskium/actions/workflows/ci.yml/badge.svg)](https://github.com/charle-z/viskium/actions/workflows/ci.yml)
 
-Estado actual: `prototyped`. Las fases fundacionales F1 y F2 tienen una ruta ejecutable y superan
-los gates locales de lock, formato, lint, tipos, property/contract/replay tests, cobertura y wheel
-aislado. Esto no representa un release, despliegue ni validación de cámara o rendimiento.
+Viskium es una base local y acotada para captura temporal, observaciones estructuradas y acceso
+visual bajo demanda. Está en **pre-alpha**: ya ofrece infraestructura ejecutable y comprobada,
+pero todavía no define un producto final de reconocimiento, traducción o asistencia visual.
 
-Actualmente existen el paquete instalable, la CLI read-only `doctor`/`config`, contratos
-neutrales, fuente y processor sintéticos, almacenamiento acotado en memoria y replay
-`exhaustive`/`faithful`. Todavía no existen acceso a cámara, modelos, SQLite, persistencia en
-disco, vista de producto ni un producto definido.
+El diseño prioriza tres propiedades: los frames e imágenes son efímeros, la cámara tiene un solo
+dueño con cierre acotado y la presión de RAM/disco degrada funciones concretas sin tumbar toda la
+aplicación. Los valores por defecto son presupuestos modestos para equipos limitados; las
+resoluciones, FPS, esperas y tamaños de snapshot se pueden ajustar dentro de techos de seguridad
+prácticos.
 
-## Ruta ejecutable actual
+## Qué existe
 
-Con Python 3.13 y el lock reproducible del repositorio:
+| Superficie | Estado actual |
+|---|---|
+| Contratos, replay exhaustivo sintético y procesamiento determinista | Validado por pruebas automatizadas |
+| Replay faithful sintético | Prototipado; latest-only con tiempos fijos, sin paridad física afirmada |
+| SQLite para observaciones estructuradas con TTL, cuotas y consultas acotadas | Validado por pruebas automatizadas |
+| Latest-frame/latest-observation, scheduler y writer con backpressure | Validado como componentes |
+| Controlador de cámara con ownership, deadlines, cooldown y epochs | Validado con dobles y fault tests |
+| Backend OpenCV aislado en proceso y snapshot PNG one-shot | Prototipado; smoke físico local aprobado en un dispositivo |
+| Servicio MCP local con consentimiento explícito | Prototipado y probado in-memory |
+
+No existen todavía un modelo de visión seleccionado, traducción, UI final, ingestión desde
+teléfono, audio, nube ni un pipeline continuo ejecutable que conecte todos los componentes. El
+tool de observación del servidor MCP devuelve `empty` hasta que un productor in-process publique
+observaciones. Ninguna capacidad se presenta como desplegada.
+
+## Inicio rápido
+
+Requiere Python 3.13 y [uv](https://docs.astral.sh/uv/):
 
 ```console
-uv sync --locked --group dev
-uv run viskium doctor --json
-uv run viskium config show --effective --json
-uv run viskium replay --mode exhaustive --frames 12 --json
-uv run viskium replay --mode faithful --frames 12 --json
+uv sync --locked --no-dev --extra agent --extra camera
+uv run --no-sync viskium doctor --json
+uv run --no-sync viskium replay --mode faithful --frames 12 --json
 ```
 
-`doctor` y la carga de configuración inspeccionan rutas y recursos sin crear la raíz de datos ni
-abrir hardware. Los dos modos de replay operan únicamente con datos sintéticos en esta fase.
-El replay sintético rechaza más de 10 000 frames por ejecución para mantener acotadas CPU, RAM y
-salida; no es un límite futuro para una sesión de cámara.
+La instalación base no obliga a instalar OpenCV ni MCP. Se pueden seleccionar por separado con
+los extras `camera` y `agent`. La ruta ejecutable soportada actualmente es Windows o Linux.
+El modo `faithful` es todavía un replay sintético: conserva la política latest-only bajo tiempos
+fijos y no afirma paridad con jitter, reconexiones, deadlines ni drivers de una cámara física.
 
-## Licencia
+## Almacenamiento local
 
-Viskium se publica bajo la Apache License 2.0. Consulta [LICENSE](LICENSE) para los términos
-completos.
+La raíz de datos nunca se crea de forma implícita:
 
-## Identidad técnica
+```console
+uv run --no-sync viskium storage init --data-root .viskium --json
+uv run --no-sync viskium storage status --data-root .viskium --json
+uv run --no-sync viskium storage purge-expired --data-root .viskium --limit 128 --json
+```
 
-- Nombre público: `Viskium`.
-- Distribución Python provisional: `viskium`.
-- Paquete importable estable: `viskium`.
-- CLI: `viskium`.
-- Schema ID: `viskium.<contrato>` con versión entera independiente.
-- Variable para la raíz de datos: `VISKIUM_DATA_ROOT`.
-- Raíz candidata para este equipo: `D:\ViskiumData` — no creada todavía.
+Viskium persiste únicamente observaciones estructuradas con TTL. SQLite rechaza los registros que
+el productor declara con `persistence_class="visual"` o `sensitivity_class="prohibited"`; todavía
+no existe un detector semántico que pueda corregir una clasificación falsa. Los frames crudos y
+snapshots de los adaptadores incluidos se mantienen en memoria y Viskium no los escribe al disco.
+Esto no promete borrar rastros que el sistema operativo, un driver o el archivo de paginación
+puedan conservar fuera del control del proceso.
 
-La marca, la distribución, el paquete Python, los schemas y la ubicación de datos están desacoplados para que un cambio futuro no obligue a migrar todo el sistema.
+## Acceso para agentes
 
-## Documentación fundacional
+El servidor expone exactamente tres tools versionadas:
 
-- [Constitución de ingeniería](docs/engineering-constitution.md)
-- [Arquitectura neutral](docs/architecture/overview.md)
-- [Política de recursos y datos](docs/architecture/resource-and-data-policy.md)
-- [Resolución de la auditoría adversarial](docs/adversarial-resolution.md)
-- [ADR 0001: identidad y fundamento](docs/decisions/0001-foundation.md)
-- [Matriz de capacidades](docs/capabilities.md)
+- `viskium_status_v1`: configuración y health de cierre mínimos, sin contadores de actividad,
+  sin abrir cámara ni exigir consentimiento.
+- `viskium_latest_observation_v1`: última observación fresca y compatible.
+- `viskium_snapshot_v1`: una captura PNG acotada, con apertura y cierre en la misma llamada.
 
-## Gate de producto
+La superficie MCP no ofrece tools para otorgar consentimiento, abrir una sesión continua ni
+administrar el lifecycle de cámara. El usuario prepara la raíz y concede scopes fuera del
+protocolo:
 
-Antes de elegir modelos, ontología, resolución, FPS o UI final se requieren tres escenarios concretos. Cada escenario debe declarar:
+```console
+uv run --no-sync viskium storage init --data-root .viskium
+uv run --no-sync viskium consent grant --data-root .viskium --scope observation.read --scope snapshot.read --duration-seconds 3600 --snapshot-quota 100 --sensitivity-ceiling identifiable
+uv run --no-sync viskium agent serve --data-root .viskium
+```
 
-1. Entrada exacta.
-2. Salida visible esperada.
-3. Evento mínimo que no puede perderse.
-4. Latencia y frescura máximas útiles.
-5. Error más costoso: omitir, inventar o llegar tarde.
-6. Observaciones que deben persistirse, durante cuánto tiempo y con qué sensibilidad.
-7. Jornada de uso y ejecución en segundo plano.
+El último comando habla MCP por `stdio`; normalmente lo inicia el host del agente, no una
+persona para interactuar con él. [`.codex/config.toml`](.codex/config.toml) contiene una
+configuración de proyecto deshabilitada en clones nuevos. Después de inicializar `.viskium`
+y conceder consentimiento, confía en el proyecto, cambia `enabled = true` localmente y reinicia
+el host de Codex para que cargue el servidor.
 
-Hasta entonces pueden seguir endureciéndose el núcleo sintético y las pruebas de recursos. La
-persistencia SQLite, la captura física y cualquier modelo continúan detrás de sus gates.
+El launcher configurado usa el comando global `python` solo para localizar y ejecutar el Python
+3.13 ya sincronizado en `.venv`; no invoca `uv` ni instala nada. En un Linux que solo tenga el
+alias `python3`, cambia localmente `command = "python3"`. Si `uv` deja de estar en `PATH` después
+de crear el entorno, cualquier comando `uv run --no-sync viskium ...` de esta guía puede ejecutarse
+directamente como `.venv\\Scripts\\viskium.exe ...` en Windows o `.venv/bin/viskium ...` en POSIX.
+
+Al terminar, revoca primero el grant para cortar el acceso inmediatamente:
+
+```console
+uv run --no-sync viskium consent revoke --data-root .viskium
+```
+
+Después restaura `enabled = false` en `.codex/config.toml` y reinicia Codex. Esperar a la expiración
+también cierra el grant, pero no es necesario conservarlo cuando la tarea ya terminó.
+
+Defaults del snapshot: 640×480 a 15 FPS solicitados, PNG de hasta 4 MiB, borde de 1280 px y espera
+de 10 s. La CLI permite llegar hasta 8 MiB, 1920 px y 15 s. La captura general admite
+configuraciones mayores de forma explícita; estos límites del tool one-shot evitan que una llamada
+de agente se convierta accidentalmente en streaming.
+
+## Prueba física opt-in
+
+Las pruebas normales y CI no abren cámaras. En un equipo autorizado, el smoke solicita una sola
+imagen 640×480, no la muestra ni la guarda y verifica el cierre:
+
+```powershell
+$env:VISKIUM_RUN_CAMERA_TESTS = "1"
+uv run pytest tests/hardware/test_camera_smoke.py -m hardware
+Remove-Item Env:VISKIUM_RUN_CAMERA_TESTS
+```
+
+Se puede seleccionar otro dispositivo con `VISKIUM_CAMERA_DEVICE_INDEX`. No ejecutes esta
+prueba sobre hardware ajeno o mientras otra aplicación necesite la cámara. El corte actual pasó
+esta ruta completa con consentimiento, admisión y cliente MCP en un host Windows; eso no sustituye
+pruebas de unplug, busy, sleep/resume ni una caracterización prolongada.
+
+## Gates de ingeniería
+
+```console
+uv run ruff format --check .
+uv run ruff check .
+uv run mypy
+uv run pytest
+uv run python -m build --no-isolation --outdir dist
+```
+
+Para estos gates instala primero el grupo `dev` como se indica en
+[CONTRIBUTING.md](CONTRIBUTING.md). La suite usa branch coverage mínima de 90%, tests
+contract/property/fault/integration y una
+matriz pública Windows/Ubuntu. Consulta la [arquitectura](docs/architecture/overview.md), la
+[política de recursos y datos](docs/architecture/resource-and-data-policy.md), la
+[matriz de capacidades](docs/capabilities.md) y la
+[resolución adversarial](docs/adversarial-resolution.md).
+
+## Identidad y licencia
+
+- Proyecto, distribución, paquete y CLI: `viskium`.
+- Contratos: URN/versiones independientes por frontera.
+- Variable de raíz de datos: `VISKIUM_DATA_ROOT`.
+- Licencia: [Apache License 2.0](LICENSE).
+
+La marca, los schemas y la ubicación de datos están desacoplados para permitir migraciones sin
+romper todo el sistema.

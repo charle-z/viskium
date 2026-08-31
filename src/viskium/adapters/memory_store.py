@@ -2,94 +2,8 @@
 
 from __future__ import annotations
 
-import json
-from collections.abc import Iterator, Mapping
-from typing import Any
-
 from viskium.core import ObservationEnvelope, PersistenceReceipt
-
-_STRING_CHUNK_CHARS = 4_096
-
-
-def _json_string_tokens(value: str) -> Iterator[str]:
-    """Yield an escaped JSON string without materializing an unbounded copy."""
-
-    yield '"'
-    for offset in range(0, len(value), _STRING_CHUNK_CHARS):
-        escaped = json.dumps(value[offset : offset + _STRING_CHUNK_CHARS], ensure_ascii=False)
-        yield escaped[1:-1]
-    yield '"'
-
-
-def _json_tokens(value: Any) -> Iterator[str]:
-    if value is None:
-        yield "null"
-        return
-    if value is True:
-        yield "true"
-        return
-    if value is False:
-        yield "false"
-        return
-    if isinstance(value, str):
-        yield from _json_string_tokens(value)
-        return
-    if isinstance(value, int):
-        yield str(value)
-        return
-    if isinstance(value, float):
-        yield json.dumps(value, allow_nan=False, separators=(",", ":"))
-        return
-    if isinstance(value, Mapping):
-        yield "{"
-        for index, key in enumerate(sorted(value)):
-            if index:
-                yield ","
-            yield from _json_string_tokens(key)
-            yield ":"
-            yield from _json_tokens(value[key])
-        yield "}"
-        return
-    if isinstance(value, tuple):
-        yield "["
-        for index, item in enumerate(value):
-            if index:
-                yield ","
-            yield from _json_tokens(item)
-        yield "]"
-        return
-    raise TypeError(f"unsupported observation payload type: {type(value).__name__}")
-
-
-def _encoded_size(observation: ObservationEnvelope, *, stop_after: int) -> int | None:
-    """Return canonical JSON bytes, or ``None`` once the ceiling is crossed."""
-
-    document = {
-        "session_id": observation.session_id,
-        "source_id": observation.source_id,
-        "stream_epoch": observation.stream_epoch,
-        "source_sequence": observation.source_sequence,
-        "observed_monotonic_ns": observation.observed_monotonic_ns,
-        "producer_id": observation.producer_id,
-        "producer_version": observation.producer_version,
-        "schema_id": observation.schema_id,
-        "schema_version": observation.schema_version,
-        "payload": dict(observation.payload),
-        "idempotency_key": observation.idempotency_key,
-        "trace_id": observation.trace_id,
-        "confidence": observation.confidence,
-        "provenance": observation.provenance,
-        "sensitivity_class": observation.sensitivity_class,
-        "persistence_class": observation.persistence_class,
-        "ttl_ns": observation.ttl_ns,
-        "wall_utc": observation.wall_utc,
-    }
-    encoded_size = 0
-    for token in _json_tokens(document):
-        encoded_size += len(token.encode("utf-8"))
-        if encoded_size > stop_after:
-            return None
-    return encoded_size
+from viskium.core.serialization import observation_size
 
 
 class MemoryStore:
@@ -156,26 +70,26 @@ class MemoryStore:
             )
 
         try:
-            observation_size = _encoded_size(observation, stop_after=self._max_bytes)
+            encoded_size = observation_size(observation, stop_after=self._max_bytes)
         except (RecursionError, TypeError, ValueError):
             return PersistenceReceipt(status="rejected", reason="payload_not_serializable")
 
-        if observation_size is None:
+        if encoded_size is None:
             return PersistenceReceipt(status="rejected", reason="observation_exceeds_byte_limit")
         if len(self._observations) >= self._max_observations:
             return PersistenceReceipt(status="rejected", reason="count_limit_reached")
-        if self._bytes_used + observation_size > self._max_bytes:
+        if self._bytes_used + encoded_size > self._max_bytes:
             return PersistenceReceipt(status="rejected", reason="byte_limit_reached")
 
         self._observations.append(observation)
         store_sequence = len(self._observations)
         self._sequences_by_key[observation.idempotency_key] = store_sequence
         self._observations_by_key[observation.idempotency_key] = observation
-        self._bytes_used += observation_size
+        self._bytes_used += encoded_size
         return PersistenceReceipt(
             status="accepted",
             store_sequence=store_sequence,
-            bytes_accepted=observation_size,
+            bytes_accepted=encoded_size,
         )
 
     def clear(self) -> None:

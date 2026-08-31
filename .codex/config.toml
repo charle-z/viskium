@@ -1,0 +1,11 @@
+# Project-scoped MCP template. It is deliberately disabled in a fresh clone:
+# initialize .viskium and grant local consent before enabling this server.
+# `python` only runs the stdlib launcher, which then selects this repository's
+# Python 3.13 `.venv`. On a POSIX host with only `python3`, change this command
+# locally to `python3`; no `uv` executable is needed after the environment exists.
+[mcp_servers.viskium]
+command = "python"
+args = ["scripts/viskium_mcp_launcher.py"]
+enabled = false
+startup_timeout_sec = 20
+tool_timeout_sec = 20
