@@ -26,6 +26,8 @@ DATA_CATEGORIES = (
 )
 _MARKER_KIND = "viskium.data-root"
 _MAX_MARKER_BYTES = 16_384
+_PRIVATE_DIRECTORY_MODE = 0o700
+_PRIVATE_FILE_MODE = 0o600
 
 
 class StorageLayoutError(ValueError):
@@ -88,6 +90,18 @@ def _require_plain_directory(path: Path) -> None:
         raise StorageLayoutError(f"cannot inspect layout directory: {path}") from error
 
 
+def _require_private_directory(path: Path) -> None:
+    _require_plain_directory(path)
+    if os.name == "nt":
+        return
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError as error:
+        raise StorageLayoutError(f"cannot inspect layout directory mode: {path}") from error
+    if mode & 0o077:
+        raise StorageLayoutError(f"layout directory must be private: {path}")
+
+
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -115,6 +129,8 @@ def _write_marker_atomically(root: Path, root_id: str) -> None:
     payload = _marker_bytes(root_id)
     try:
         with temporary.open("xb") as stream:
+            if os.name != "nt":
+                os.chmod(temporary, _PRIVATE_FILE_MODE)
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
@@ -146,9 +162,14 @@ def initialize_data_root(
             raise StorageLayoutError(f"cannot inspect candidate data root: {root}") from error
         if existing:
             raise StorageLayoutError("an unmarked data root must be empty")
+        if os.name != "nt":
+            try:
+                root.chmod(_PRIVATE_DIRECTORY_MODE)
+            except OSError as error:
+                raise StorageLayoutError(f"cannot secure candidate data root: {root}") from error
     else:
         try:
-            root.mkdir(parents=True, exist_ok=False)
+            root.mkdir(mode=_PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=False)
         except OSError as error:
             raise StorageLayoutError(f"cannot create data root: {root}") from error
 
@@ -162,7 +183,7 @@ def initialize_data_root(
     canonical_id = str(selected_id)
     try:
         for category in DATA_CATEGORIES:
-            (root / category).mkdir(exist_ok=False)
+            (root / category).mkdir(mode=_PRIVATE_DIRECTORY_MODE, exist_ok=False)
         _write_marker_atomically(root, canonical_id)
     except (OSError, StorageLayoutError) as error:
         raise StorageLayoutError(f"data root initialization did not complete: {root}") from error
@@ -173,7 +194,7 @@ def verify_data_root(value: str | os.PathLike[str]) -> DataRootLayout:
     """Verify a root without creating, repairing, or following owned links."""
 
     root = _absolute_root(value)
-    _require_plain_directory(root)
+    _require_private_directory(root)
     marker = root / DATA_ROOT_MARKER
     if not marker.exists() or _is_reparse_or_symlink(marker):
         raise StorageLayoutError(f"valid data root marker not found: {marker}")
@@ -181,6 +202,8 @@ def verify_data_root(value: str | os.PathLike[str]) -> DataRootLayout:
         metadata = marker.stat()
         if not stat.S_ISREG(metadata.st_mode):
             raise StorageLayoutError("data root marker is not a regular file")
+        if os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise StorageLayoutError("data root marker must be private")
         if metadata.st_size > _MAX_MARKER_BYTES:
             raise StorageLayoutError("data root marker exceeds its byte limit")
         raw = marker.read_bytes()
@@ -206,7 +229,7 @@ def verify_data_root(value: str | os.PathLike[str]) -> DataRootLayout:
     if document["root_id"] != canonical_id:
         raise StorageLayoutError("data root root_id is not canonical")
     for category in DATA_CATEGORIES:
-        _require_plain_directory(root / category)
+        _require_private_directory(root / category)
     return DataRootLayout(root=root, root_id=canonical_id)
 
 
