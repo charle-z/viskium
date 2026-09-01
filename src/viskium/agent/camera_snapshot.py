@@ -11,6 +11,7 @@ stream, request, and connection references before reporting that failure.
 from __future__ import annotations
 
 import math
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -44,7 +45,12 @@ from viskium.snapshots import (
     encode_png_snapshot,
 )
 
-from .service import SnapshotCaptureResult
+from .service import (
+    SnapshotCaptureResult,
+    SnapshotReasonCode,
+    normalize_snapshot_reason,
+    normalize_snapshot_reason_for_outcome,
+)
 
 DEFAULT_MINIMUM_OPEN_INTERVAL_SECONDS = 0.5
 DEFAULT_WARMUP_FRAMES = 3
@@ -121,6 +127,17 @@ def _require_source_id(value: object) -> str:
     if len(value) > _MAX_IDENTIFIER_CHARS:
         raise ValueError(f"source_id must not exceed {_MAX_IDENTIFIER_CHARS} characters")
     return value
+
+
+def _safe_capture_open_reason(error: CaptureOpenError) -> SnapshotReasonCode:
+    """Read one exact, allowlisted exception argument without formatting it."""
+
+    if type(error) is not CaptureOpenError:
+        return "generic"
+    arguments = error.args
+    if type(arguments) is not tuple or len(arguments) != 1 or type(arguments[0]) is not str:
+        return "generic"
+    return normalize_snapshot_reason(arguments[0])
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,12 +393,14 @@ class CameraSnapshotProvider:
             # Recheck only after acquiring the operation lock.  A previous
             # capture can latch a close failure between an optimistic check
             # and this acquisition; no later call may create another backend.
-            if self._is_close_stuck() or self._lease_held:
-                return self._failed()
+            if self._is_close_stuck():
+                return self._failed("close_stuck")
+            if self._lease_held:
+                return self._failed("lease_release_failed")
             try:
                 started_ns = _bounded_clock(self._monotonic_ns)
             except Exception:
-                return self._failed()
+                return self._failed("generic")
             duration_ns = int(timeout * 1_000_000_000)
             if duration_ns <= 0:
                 return self._timeout()
@@ -389,31 +408,35 @@ class CameraSnapshotProvider:
             if self._open_is_throttled(started_ns):
                 self._count(self._BUSY)
                 self._count(self._THROTTLED)
-                return SnapshotCaptureResult("busy")
-            if not self._resources_admit(byte_limit):
-                self._count(self._RESOURCE_DENIED)
-                return SnapshotCaptureResult("unavailable")
+                return SnapshotCaptureResult("busy", reason_code="throttled")
+            resource_reason = self._resources_admit(byte_limit)
+            if resource_reason is not None:
+                if resource_reason == "resource_denied":
+                    self._count(self._RESOURCE_DENIED)
+                else:
+                    self._count(self._FAILURES)
+                return SnapshotCaptureResult("unavailable", reason_code=resource_reason)
 
             try:
                 open_started_ns = _bounded_clock(self._monotonic_ns)
             except Exception:
-                return self._failed()
+                return self._failed("generic")
             if open_started_ns < started_ns:
-                return self._failed()
+                return self._failed("generic")
             if open_started_ns >= deadline_ns:
                 return self._timeout()
             if self._open_is_throttled(open_started_ns):
                 self._count(self._BUSY)
                 self._count(self._THROTTLED)
-                return SnapshotCaptureResult("busy")
+                return SnapshotCaptureResult("busy", reason_code="throttled")
 
             try:
                 lease_held = self._lease.acquire()
             except Exception:
-                return self._failed()
+                return self._failed("generic")
             if not isinstance(lease_held, bool) or not lease_held:
                 self._count(self._BUSY)
-                return SnapshotCaptureResult("busy")
+                return SnapshotCaptureResult("busy", reason_code="lease_busy")
             self._lease_held = True
             self._last_open_started_ns = open_started_ns
             self._attempt_sequence = min(_MAX_INT64, self._attempt_sequence + 1)
@@ -425,6 +448,7 @@ class CameraSnapshotProvider:
                 byte_limit=byte_limit,
             )
         finally:
+            pending_exception = sys.exc_info()[0] is not None
             try:
                 if self._lease_held and not self._is_close_stuck():
                     try:
@@ -432,7 +456,10 @@ class CameraSnapshotProvider:
                     except Exception:
                         # Ownership is intentionally retained when release is not
                         # confirmed; subsequent calls remain fail-closed.
-                        self._count(self._FAILURES)
+                        if pending_exception:
+                            self._count(self._FAILURES)
+                        else:
+                            return self._failed("lease_release_failed")
                     else:
                         self._lease_held = False
             finally:
@@ -440,22 +467,22 @@ class CameraSnapshotProvider:
                 # never strand the provider's in-process operation lock.
                 self._operation_lock.release()
 
-    def _resources_admit(self, byte_limit: int) -> bool:
+    def _resources_admit(self, byte_limit: int) -> SnapshotReasonCode | None:
         gate = self._resource_gate
         if gate is None:
-            return True
+            return None
         estimated_bytes = (
             self._estimated_backend_bytes + self._capture_request.max_frame_bytes + (2 * byte_limit)
         )
         try:
             decision = gate.evaluate(stage="processing", estimated_bytes=estimated_bytes)
         except Exception:
-            return False
-        return (
-            isinstance(decision, BudgetDecision)
-            and decision.allow_capture
-            and decision.allow_processing
-        )
+            return "resource_gate_failed"
+        if not isinstance(decision, BudgetDecision):
+            return "resource_gate_failed"
+        if not decision.allow_capture or not decision.allow_processing:
+            return "resource_denied"
+        return None
 
     def _open_is_throttled(self, now_ns: int) -> bool:
         previous_ns = self._last_open_started_ns
@@ -517,9 +544,9 @@ class CameraSnapshotProvider:
         try:
             candidate = self._backend_factory()
         except Exception:
-            return self._failed()
+            return self._failed("generic")
         if not isinstance(candidate, CaptureBackend):
-            return self._failed()
+            return self._failed("generic")
 
         result = SnapshotCaptureResult("failed")
         close_failed = False
@@ -535,10 +562,15 @@ class CameraSnapshotProvider:
                 )
             except CaptureDeadlineExceeded:
                 result = self._timeout()
-            except CaptureOpenError:
-                result = SnapshotCaptureResult("unavailable")
+            except CaptureOpenError as error:
+                reason = _safe_capture_open_reason(error)
+                result = (
+                    self._timeout(reason)
+                    if reason == "camera_open_timeout"
+                    else SnapshotCaptureResult("unavailable", reason_code=reason)
+                )
             except Exception:
-                result = self._failed()
+                result = self._failed("generic")
         finally:
             try:
                 candidate.close()
@@ -557,7 +589,7 @@ class CameraSnapshotProvider:
                     self._latch_close_failure(candidate, state="unknown")
                     raise
         if close_failed:
-            return self._failed()
+            return self._failed("close_failed")
         if result.outcome == "ok":
             self._count(self._DELIVERED)
         return result
@@ -573,13 +605,13 @@ class CameraSnapshotProvider:
     ) -> SnapshotCaptureResult:
         capabilities = backend.capabilities
         if not isinstance(capabilities, CaptureCapabilities) or not capabilities.safe_in_process:
-            return self._failed()
+            return self._failed("generic")
         if self._deadline_expired(deadline_ns):
             return self._timeout()
 
         stream = backend.open(self._capture_request, deadline_monotonic_ns=deadline_ns)
         if not isinstance(stream, NegotiatedStream):
-            return self._failed()
+            return self._failed("generic")
         self._count(self._OPENS)
 
         for _ in range(self._warmup_frames):
@@ -587,7 +619,7 @@ class CameraSnapshotProvider:
             if warmup.status is not ReadStatus.FRAME:
                 return self._map_read_failure(warmup)
             if not self._frame_matches_stream(warmup.frame, stream):
-                return self._failed()
+                return self._failed("generic")
 
         target: CaptureRead | None = None
         target_sequence = self._warmup_frames
@@ -599,12 +631,17 @@ class CameraSnapshotProvider:
             if target.status is not ReadStatus.RECOVERABLE_ERROR:
                 return self._map_read_failure(target)
             if attempt + 1 >= self._max_attempts:
-                return self._failed()
+                return self._failed(
+                    normalize_snapshot_reason_for_outcome(
+                        target.reason_code,
+                        outcome="failed",
+                    )
+                )
         if target is None or not self._frame_matches_stream(target.frame, stream):
-            return self._failed()
+            return self._failed("generic")
         backend_frame = target.frame
         if backend_frame is None:
-            return self._failed()
+            return self._failed("generic")
 
         frame = FrameEnvelope(
             source_id=self._source_id,
@@ -624,7 +661,7 @@ class CameraSnapshotProvider:
             max_bytes=byte_limit,
         )
         if not isinstance(snapshot, SnapshotEnvelope):
-            return self._failed()
+            return self._failed("generic")
         if self._deadline_expired(deadline_ns):
             return self._timeout()
         return SnapshotCaptureResult("ok", snapshot)
@@ -656,19 +693,26 @@ class CameraSnapshotProvider:
         )
 
     def _map_read_failure(self, result: CaptureRead) -> SnapshotCaptureResult:
+        reason = normalize_snapshot_reason(result.reason_code)
         if result.status is ReadStatus.TIMEOUT:
-            return self._timeout()
+            return SnapshotCaptureResult("timeout", reason_code=reason)
         if result.status is ReadStatus.DISCONNECTED:
-            return SnapshotCaptureResult("unavailable")
-        return self._failed()
+            return SnapshotCaptureResult("unavailable", reason_code=reason)
+        return SnapshotCaptureResult("failed", reason_code=reason)
 
-    def _timeout(self) -> SnapshotCaptureResult:
+    def _timeout(self, reason_code: object = "timeout") -> SnapshotCaptureResult:
         self._count(self._TIMEOUTS)
-        return SnapshotCaptureResult("timeout")
+        return SnapshotCaptureResult(
+            "timeout",
+            reason_code=normalize_snapshot_reason(reason_code),
+        )
 
-    def _failed(self) -> SnapshotCaptureResult:
+    def _failed(self, reason_code: object | None = None) -> SnapshotCaptureResult:
         self._count(self._FAILURES)
-        return SnapshotCaptureResult("failed")
+        return SnapshotCaptureResult(
+            "failed",
+            reason_code=(None if reason_code is None else normalize_snapshot_reason(reason_code)),
+        )
 
     def _count(self, index: int) -> None:
         with self._metrics_lock:

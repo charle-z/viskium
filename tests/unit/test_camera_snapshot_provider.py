@@ -360,6 +360,20 @@ def test_zero_timeout_and_resource_denial_never_create_or_open_backend() -> None
         )
     ]
     assert denied.metrics.resource_denied == 1
+    assert denied.capture(max_edge_px=64, max_bytes=1_024, timeout_seconds=1.0).reason_code == (
+        "resource_denied"
+    )
+
+
+def test_provider_normalizes_untrusted_read_reason_without_leaking_it() -> None:
+    backend = ScriptedBackend(
+        [CaptureRead(ReadStatus.DISCONNECTED, reason_code=r"driver failure at C:\\private")]
+    )
+    result = _capture(_provider(BackendFactory([backend])))
+
+    assert result.outcome == "unavailable"
+    assert result.reason_code == "generic"
+    assert "private" not in repr(result)
 
 
 @pytest.mark.parametrize(
@@ -376,6 +390,7 @@ def test_resource_gate_failure_fails_closed_without_hardware(gate: AdmissionGate
     result = _capture(provider)
 
     assert result.outcome == "unavailable"
+    assert result.reason_code == "resource_gate_failed"
     assert result.snapshot is None
     assert factory.calls == []
 
@@ -526,6 +541,31 @@ def test_open_errors_are_sanitized_and_backend_is_always_closed(
     assert backend.close_calls == 1
 
 
+def test_camera_open_timeout_is_a_timeout_with_a_safe_reason() -> None:
+    backend = ScriptedBackend([], open_error=CaptureOpenError("camera_open_timeout"))
+    provider = _provider(BackendFactory([backend]))
+
+    result = _capture(provider)
+
+    assert result.outcome == "timeout"
+    assert result.reason_code == "camera_open_timeout"
+    assert provider.metrics.timeouts == 1
+    assert backend.close_calls == 1
+
+
+def test_open_error_reason_extraction_never_calls_error_str() -> None:
+    class MaliciousOpenError(CaptureOpenError):
+        def __str__(self) -> str:
+            raise AssertionError("provider must not format backend errors")
+
+    backend = ScriptedBackend([], open_error=MaliciousOpenError(r"driver C:\\private"))
+    result = _capture(_provider(BackendFactory([backend])))
+
+    assert result.outcome == "unavailable"
+    assert result.reason_code == "generic"
+    assert backend.close_calls == 1
+
+
 @pytest.mark.parametrize(
     ("read", "expected"),
     [
@@ -575,6 +615,128 @@ def test_exactly_one_recoverable_retry_is_optional_and_never_reopens() -> None:
     assert no_retry.outcome == "failed"
     assert len(no_retry_backend.reads) == 1
     assert no_retry_backend.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("max_attempts", "reads"),
+    [
+        (1, [CaptureRead(ReadStatus.RECOVERABLE_ERROR, reason_code="capture_read_error")]),
+        (
+            2,
+            [
+                CaptureRead(ReadStatus.RECOVERABLE_ERROR, reason_code="capture_read_error"),
+                CaptureRead(ReadStatus.RECOVERABLE_ERROR, reason_code="capture_read_error"),
+            ],
+        ),
+    ],
+)
+def test_exhausted_recoverable_attempts_preserve_compatible_reason(
+    max_attempts: int,
+    reads: list[CaptureRead],
+) -> None:
+    provider = _provider(
+        BackendFactory([ScriptedBackend(reads)]),
+        max_attempts=max_attempts,
+    )
+
+    result = _capture(provider)
+
+    assert result.outcome == "failed"
+    assert result.reason_code == "capture_read_error"
+
+
+def test_exhausted_recoverable_attempt_rejects_incompatible_or_malicious_reason() -> None:
+    class MaliciousString(str):
+        def __eq__(self, _other: object) -> bool:
+            raise AssertionError("reason normalization must not compare subclasses")
+
+    incompatible = _capture(
+        _provider(
+            BackendFactory(
+                [
+                    ScriptedBackend(
+                        [
+                            CaptureRead(
+                                ReadStatus.RECOVERABLE_ERROR, reason_code="device_open_failed"
+                            )
+                        ]
+                    )
+                ]
+            )
+        )
+    )
+    malicious = _capture(
+        _provider(
+            BackendFactory(
+                [
+                    ScriptedBackend(
+                        [
+                            CaptureRead(
+                                ReadStatus.RECOVERABLE_ERROR,
+                                reason_code=MaliciousString("capture_read_error"),  # type: ignore[arg-type]
+                            )
+                        ]
+                    )
+                ]
+            )
+        )
+    )
+
+    assert incompatible.outcome == "failed"
+    assert incompatible.reason_code == "generic"
+    assert malicious.outcome == "failed"
+    assert malicious.reason_code == "generic"
+
+
+def test_normal_lease_release_failure_invalidates_success_and_remains_fail_closed() -> None:
+    class FailingReleaseLease(InMemoryLease):
+        def release(self) -> None:
+            self.release_calls += 1
+            raise RuntimeError("private lease detail")
+
+    lease = FailingReleaseLease()
+    backend = ScriptedBackend([_frame_read()])
+    unopened = ScriptedBackend([_frame_read()])
+    factory = BackendFactory([backend, unopened])
+    provider = _provider(factory, lease=lease)
+
+    first = _capture(provider)
+    second = _capture(provider)
+
+    assert first.outcome == "failed"
+    assert first.reason_code == "lease_release_failed"
+    assert first.snapshot is None
+    assert second.outcome == "failed"
+    assert second.reason_code == "lease_release_failed"
+    assert lease.release_calls == 2
+    assert lease.held
+    assert len(factory.calls) == 1
+    assert backend.close_calls == 1
+    assert unopened.events == []
+    assert not provider.metrics.active
+
+
+def test_lease_release_failure_does_not_swallow_pending_interrupt() -> None:
+    class InjectedInterrupt(BaseException):
+        pass
+
+    class FailingReleaseLease(InMemoryLease):
+        def release(self) -> None:
+            self.release_calls += 1
+            raise RuntimeError("private lease detail")
+
+    lease = FailingReleaseLease()
+    backend = ScriptedBackend([InjectedInterrupt()])
+    provider = _provider(BackendFactory([backend]), lease=lease)
+
+    with pytest.raises(InjectedInterrupt):
+        _capture(provider)
+
+    assert lease.release_calls == 1
+    assert lease.held
+    assert not provider.metrics.active
+    assert provider.metrics.failures == 1
+    assert not provider.metrics.backend_retained
 
 
 def test_encode_and_close_errors_are_sanitized_and_discard_snapshot(

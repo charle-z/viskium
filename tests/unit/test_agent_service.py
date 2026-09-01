@@ -18,6 +18,7 @@ from viskium.agent import (
     AgentStatusResult,
     ConsentLedger,
     SnapshotCaptureResult,
+    normalize_snapshot_reason,
 )
 from viskium.agent import service as service_module
 from viskium.core import FrameEnvelope, ObservationEnvelope
@@ -551,6 +552,20 @@ def test_snapshot_reserves_before_provider_and_failed_attempt_consumes_quota(
     assert state.snapshot_attempts == 1
 
 
+def test_snapshot_propagates_only_a_safe_provider_reason_code(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path, scopes=frozenset({"snapshot.read"}), quota=1)
+    provider = RecordingSnapshotProvider(
+        SnapshotCaptureResult("unavailable", reason_code=r"driver failure at C:\\private")
+    )
+
+    result = _service(ledger=ledger, provider=provider).snapshot(max_edge_px=64)
+
+    assert result.outcome == "unavailable"
+    assert result.reason_code == "generic"
+    assert result.explicit_reason_code == "generic"
+    assert "private" not in repr(result)
+
+
 @pytest.mark.parametrize(
     ("scopes", "quota", "expected"),
     [
@@ -846,6 +861,38 @@ def test_public_result_contracts_reject_payload_mixing_and_invalid_values() -> N
         AgentSnapshotResult("ok")
     with pytest.raises(ValueError, match="must not expose"):
         AgentSnapshotResult("failed", snapshot)
+
+
+def test_snapshot_reason_codes_are_canonical_and_semantically_bounded() -> None:
+    snapshot = _snapshot()
+
+    class MaliciousString(str):
+        def __eq__(self, _other: object) -> bool:
+            raise AssertionError("reason normalization must not compare subclasses")
+
+    assert normalize_snapshot_reason("device_open_failed") == "device_open_failed"
+    assert normalize_snapshot_reason(MaliciousString("device_open_failed")) == "generic"
+    assert normalize_snapshot_reason(r"driver failure at C:\\private") == "generic"
+
+    capture = SnapshotCaptureResult(
+        "unavailable",
+        reason_code=MaliciousString("device_open_failed"),  # type: ignore[arg-type]
+    )
+    assert capture.reason_code == "generic"
+    result = AgentSnapshotResult(
+        "unavailable",
+        reason_code=MaliciousString("device_open_failed"),  # type: ignore[arg-type]
+    )
+    assert result.reason_code == "generic"
+
+    with pytest.raises(ValueError, match="incompatible"):
+        SnapshotCaptureResult("timeout", reason_code="device_open_failed")
+    with pytest.raises(ValueError, match="incompatible"):
+        AgentSnapshotResult("failed", reason_code="device_open_failed")
+    with pytest.raises(ValueError, match="must not include"):
+        SnapshotCaptureResult("ok", snapshot, reason_code="generic")
+    with pytest.raises(ValueError, match="must not include"):
+        AgentSnapshotResult("ok", snapshot, reason_code="generic")
 
 
 def test_result_reason_codes_are_stable() -> None:

@@ -43,7 +43,10 @@ from .service import (
     SnapshotCaptureOutcome,
     SnapshotCaptureResult,
     SnapshotProvider,
+    SnapshotReasonCode,
     StatusProvider,
+    normalize_snapshot_reason,
+    normalize_snapshot_reason_for_outcome,
 )
 
 __all__ = [
@@ -80,8 +83,11 @@ __all__ = [
     "SnapshotCaptureOutcome",
     "SnapshotCaptureResult",
     "SnapshotProvider",
+    "SnapshotReasonCode",
     "SnapshotReservation",
     "SnapshotWorkerState",
     "StatusProvider",
     "evaluate_grant",
+    "normalize_snapshot_reason",
+    "normalize_snapshot_reason_for_outcome",
 ]

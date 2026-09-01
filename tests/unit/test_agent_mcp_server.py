@@ -390,6 +390,83 @@ def test_snapshot_denial_is_bounded_machine_readable_and_never_calls_provider(
     assert provider.calls == []
 
 
+@pytest.mark.parametrize(
+    ("provider_reason", "expected_reason"),
+    [
+        ("device_open_failed", "device_open_failed"),
+        (r"driver failed at C:\\private\\camera.sys", "generic"),
+    ],
+)
+def test_snapshot_failure_payload_propagates_only_safe_reason_code(
+    tmp_path: Path,
+    provider_reason: str,
+    expected_reason: str,
+) -> None:
+    provider = RecordingSnapshotProvider(
+        SnapshotCaptureResult("unavailable", reason_code=provider_reason)  # type: ignore[arg-type]
+    )
+    service, _, _ = _service(
+        tmp_path,
+        scopes=frozenset({"snapshot.read"}),
+        provider=provider,
+        quota=1,
+    )
+    server = create_mcp_server(service)
+
+    async def scenario() -> Any:
+        async with Client(server) as client:
+            return await client.call_tool(
+                SNAPSHOT_TOOL_V1,
+                {"max_edge_px": 64, "wait_ms": 1},
+            )
+
+    result = _run(scenario)
+    assert not result.is_error
+    assert len(result.content) == 1
+    assert isinstance(result.content[0], TextContent)
+    payload = json.loads(result.content[0].text)
+    assert payload == {
+        "agent_contract": "urn:viskium:agent-read:1",
+        "contract": "urn:viskium:mcp:snapshot:1",
+        "outcome": "unavailable",
+        "reason_code": expected_reason,
+    }
+    assert "driver failed" not in result.content[0].text
+    assert "private" not in result.content[0].text
+
+
+def test_snapshot_failure_payload_propagates_capture_read_error_without_payload_bytes(
+    tmp_path: Path,
+) -> None:
+    provider = RecordingSnapshotProvider(
+        SnapshotCaptureResult("failed", reason_code="capture_read_error")
+    )
+    service, _, _ = _service(
+        tmp_path,
+        scopes=frozenset({"snapshot.read"}),
+        provider=provider,
+        quota=1,
+    )
+    server = create_mcp_server(service)
+
+    async def scenario() -> Any:
+        async with Client(server) as client:
+            return await client.call_tool(
+                SNAPSHOT_TOOL_V1,
+                {"max_edge_px": 64, "wait_ms": 1},
+            )
+
+    result = _run(scenario)
+    assert not result.is_error
+    assert len(result.content) == 1
+    assert isinstance(result.content[0], TextContent)
+    payload = json.loads(result.content[0].text)
+    assert payload["outcome"] == "failed"
+    assert payload["reason_code"] == "capture_read_error"
+    assert "payload" not in payload
+    assert "bytes" not in result.content[0].text
+
+
 def test_optional_sdk_failure_is_clear_and_chained(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

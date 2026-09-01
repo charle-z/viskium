@@ -12,9 +12,9 @@ import sys
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from importlib import import_module
-from typing import TYPE_CHECKING, Annotated, Any, BinaryIO, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Annotated, Any, BinaryIO, Literal, NotRequired, TypedDict, cast
 
-from viskium.agent.service import AgentReadService
+from viskium.agent.service import AgentReadService, SnapshotReasonCode
 from viskium.core.serialization import bounded_canonical_json_bytes
 
 if TYPE_CHECKING:
@@ -74,6 +74,7 @@ class SnapshotFailureResult(TypedDict):
     contract: Literal["urn:viskium:mcp:snapshot:1"]
     agent_contract: Literal["urn:viskium:agent-read:1"]
     outcome: str
+    reason_code: NotRequired[SnapshotReasonCode]
 
 
 @dataclass(frozen=True, slots=True)
@@ -476,6 +477,8 @@ def create_mcp_server(service: AgentReadService) -> MCPServer[Any]:
                 "agent_contract": result.contract,
                 "outcome": result.outcome,
             }
+            if result.explicit_reason_code is not None:
+                failure["reason_code"] = result.explicit_reason_code
             return failure
         if snapshot.encoded_bytes > limits.max_snapshot_bytes:
             raise sdk.tool_error_type("invalid bounded snapshot result")
@@ -639,6 +642,7 @@ __all__ = [
     "STATUS_TOOL_V1",
     "MCPDependencyError",
     "MCPTransportError",
+    "SnapshotFailureResult",
     "create_mcp_server",
     "run_mcp_server",
 ]

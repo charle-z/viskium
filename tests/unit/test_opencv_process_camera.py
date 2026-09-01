@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from threading import Thread
+from typing import Any
 
+import anyio
 import pytest
+from mcp import Client
+from mcp.types import TextContent
 
 from viskium.adapters.opencv_process_camera import (
     OpenCVProcessCameraBackend,
     OpenCVWorkerState,
     _run_worker,
 )
+from viskium.agent import AgentReadService, CameraSnapshotProvider, ConsentLedger
+from viskium.agent.mcp_server import SNAPSHOT_TOOL_V1, create_mcp_server
 from viskium.capture import (
     CaptureDeadlineExceeded,
     CaptureOpenError,
@@ -18,6 +26,8 @@ from viskium.capture import (
     DeadlineCapability,
     ReadStatus,
 )
+from viskium.observations import LatestObservationSlot
+from viskium.storage import initialize_data_root
 
 
 class _FakeConnection:
@@ -134,6 +144,33 @@ class _FakeContext:
         return self.process
 
 
+class _ExitedProcess(_FakeProcess):
+    def is_alive(self) -> bool:
+        return False
+
+
+class _ExitedContext(_FakeContext):
+    def __init__(self, replies: list[object]) -> None:
+        super().__init__(replies)
+        self.process = _ExitedProcess(self.parent)
+
+
+class _RecordingLease:
+    def __init__(self) -> None:
+        self.acquire_calls = 0
+        self.release_calls = 0
+        self.held = False
+
+    def acquire(self) -> bool:
+        self.acquire_calls += 1
+        self.held = True
+        return True
+
+    def release(self) -> None:
+        self.release_calls += 1
+        self.held = False
+
+
 def _request(*, max_frame_bytes: int = 12) -> CaptureRequest:
     return CaptureRequest(0, 2, 2, 30.0, max_frame_bytes)
 
@@ -148,6 +185,96 @@ def _backend(context: _FakeContext) -> OpenCVProcessCameraBackend:
 
 def _worker_state(backend: OpenCVProcessCameraBackend) -> OpenCVWorkerState:
     return backend.worker_state
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_outcome", "expected_reason"),
+    [
+        ("device_open_failed", "unavailable", "device_open_failed"),
+        ("capture_read_failed", "unavailable", "capture_read_failed"),
+        ("camera_open_timeout", "timeout", "camera_open_timeout"),
+        ("camera_worker_exited", "unavailable", "camera_worker_exited"),
+    ],
+)
+def test_fake_opencv_provider_service_mcp_chain_is_bounded_and_releases_resources(
+    tmp_path: Path,
+    scenario: str,
+    expected_outcome: str,
+    expected_reason: str,
+) -> None:
+    if scenario == "device_open_failed":
+        context = _FakeContext([("open_error", "device_open_failed")])
+    elif scenario == "capture_read_failed":
+        context = _FakeContext([_opened(), ("disconnected", "capture_read_failed")])
+    elif scenario == "camera_open_timeout":
+        context = _FakeContext([], poll_results=[False], cooperative=False)
+    else:
+        context = _ExitedContext([_opened()])
+
+    request = CaptureRequest(
+        device_index=7,
+        requested_width=2,
+        requested_height=2,
+        requested_fps=30.0,
+        max_frame_bytes=12,
+    )
+    backend = OpenCVProcessCameraBackend(context=context, monotonic_ns=lambda: 0)
+    lease = _RecordingLease()
+    provider = CameraSnapshotProvider(
+        backend_factory=lambda: backend,
+        capture_request=request,
+        warmup_frames=0,
+        max_attempts=1,
+        minimum_open_interval_seconds=0.0,
+        monotonic_ns=lambda: 0,
+        lease=lease,
+    )
+    ledger = ConsentLedger(initialize_data_root(tmp_path / "data"))
+    ledger.grant(
+        scopes=frozenset({"snapshot.read"}),
+        duration_seconds=60,
+        snapshot_quota=1,
+        sensitivity_ceiling="identifiable",
+        now_unix_ns=1_000_000_000,
+    )
+    service = AgentReadService(
+        observations=LatestObservationSlot(),
+        consent=ledger,
+        snapshot_provider=provider,
+        status_provider=lambda: {"state": "ready"},
+        unix_time_ns=lambda: 2_000_000_000,
+        monotonic_ns=lambda: 0,
+    )
+    server = create_mcp_server(service)
+
+    async def scenario_call() -> Any:
+        async with Client(server) as client:
+            return await client.call_tool(
+                SNAPSHOT_TOOL_V1,
+                {"max_edge_px": 64, "wait_ms": 10},
+            )
+
+    result = anyio.run(scenario_call)
+    assert not result.is_error
+    assert len(result.content) == 1
+    assert isinstance(result.content[0], TextContent)
+    assert json.loads(result.content[0].text) == {
+        "agent_contract": "urn:viskium:agent-read:1",
+        "contract": "urn:viskium:mcp:snapshot:1",
+        "outcome": expected_outcome,
+        "reason_code": expected_reason,
+    }
+    assert lease.acquire_calls == 1
+    assert lease.release_calls == 1
+    assert not lease.held
+    assert backend.worker_state is OpenCVWorkerState.ABSENT
+    assert context.process_kwargs is not None
+    process_args = context.process_kwargs["args"]
+    assert isinstance(process_args, tuple)
+    assert len(process_args) == 2
+    passed_request = process_args[1]
+    assert isinstance(passed_request, CaptureRequest)
+    assert passed_request.device_index == 7
 
 
 def test_backend_open_read_and_cooperative_close_are_memory_only() -> None:

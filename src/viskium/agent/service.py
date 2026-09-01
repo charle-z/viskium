@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, Literal, Protocol, cast, runtime_checkable
 
@@ -39,6 +39,40 @@ type SnapshotCaptureOutcome = Literal[
     "closed",
     "unavailable",
     "failed",
+]
+type SnapshotReasonCode = Literal[
+    "generic",
+    "resource_denied",
+    "resource_gate_failed",
+    "busy",
+    "throttled",
+    "lease_busy",
+    "timeout",
+    "closed",
+    "close_stuck",
+    "unavailable",
+    "failed",
+    "opencv_unavailable",
+    "device_open_failed",
+    "negotiated_mode_exceeds_limit",
+    "capture_read_error",
+    "capture_read_failed",
+    "invalid_backend_frame",
+    "invalid_worker_command",
+    "camera_open_timeout",
+    "camera_open_failed",
+    "camera_worker_exited",
+    "camera_worker_disconnected",
+    "camera_worker_start_failed",
+    "opencv_worker_error",
+    "camera_worker_error",
+    "camera_read_deadline_expired",
+    "camera_read_timeout",
+    "invalid_worker_response",
+    "snapshot_deadline_expired",
+    "close_failed",
+    "lease_release_failed",
+    "invalid_open_response",
 ]
 type AgentStatusOutcome = Literal[
     "ok",
@@ -158,9 +192,123 @@ _SNAPSHOT_OUTCOMES: frozenset[str] = frozenset(
         "snapshot_limit_exceeded",
     }
 )
+_CAPTURE_OUTCOMES: frozenset[str] = frozenset(
+    {"ok", "busy", "timeout", "closed", "unavailable", "failed"}
+)
 _STATUS_OUTCOMES: frozenset[str] = frozenset(
     {"ok", "status_unavailable", "status_invalid", "metadata_too_large"}
 )
+_SNAPSHOT_REASON_CODES: frozenset[str] = frozenset(
+    {
+        "generic",
+        "resource_denied",
+        "resource_gate_failed",
+        "busy",
+        "throttled",
+        "lease_busy",
+        "timeout",
+        "closed",
+        "close_stuck",
+        "unavailable",
+        "failed",
+        "opencv_unavailable",
+        "device_open_failed",
+        "negotiated_mode_exceeds_limit",
+        "capture_read_error",
+        "capture_read_failed",
+        "invalid_backend_frame",
+        "invalid_worker_command",
+        "camera_open_timeout",
+        "camera_open_failed",
+        "camera_worker_exited",
+        "camera_worker_disconnected",
+        "camera_worker_start_failed",
+        "opencv_worker_error",
+        "camera_worker_error",
+        "camera_read_deadline_expired",
+        "camera_read_timeout",
+        "invalid_worker_response",
+        "snapshot_deadline_expired",
+        "close_failed",
+        "lease_release_failed",
+        "invalid_open_response",
+    }
+)
+_CANONICAL_SNAPSHOT_REASON_CODES: dict[str, SnapshotReasonCode] = {
+    code: cast(SnapshotReasonCode, code) for code in _SNAPSHOT_REASON_CODES
+}
+_SNAPSHOT_REASON_OUTCOMES: dict[str, frozenset[str]] = {
+    "resource_denied": frozenset({"unavailable"}),
+    "resource_gate_failed": frozenset({"unavailable"}),
+    "busy": frozenset({"busy"}),
+    "throttled": frozenset({"busy"}),
+    "lease_busy": frozenset({"busy"}),
+    "timeout": frozenset({"timeout"}),
+    "camera_open_timeout": frozenset({"timeout"}),
+    "camera_read_deadline_expired": frozenset({"timeout"}),
+    "camera_read_timeout": frozenset({"timeout"}),
+    "snapshot_deadline_expired": frozenset({"timeout"}),
+    "closed": frozenset({"closed", "failed"}),
+    "close_stuck": frozenset({"failed"}),
+    "close_failed": frozenset({"failed"}),
+    "lease_release_failed": frozenset({"failed"}),
+    "unavailable": frozenset({"unavailable"}),
+    "opencv_unavailable": frozenset({"unavailable"}),
+    "device_open_failed": frozenset({"unavailable"}),
+    "negotiated_mode_exceeds_limit": frozenset({"unavailable"}),
+    "camera_open_failed": frozenset({"unavailable"}),
+    "invalid_open_response": frozenset({"unavailable"}),
+    "camera_worker_exited": frozenset({"unavailable"}),
+    "camera_worker_disconnected": frozenset({"unavailable"}),
+    "capture_read_failed": frozenset({"unavailable"}),
+    "failed": frozenset({"failed"}),
+    "capture_read_error": frozenset({"failed"}),
+    "invalid_backend_frame": frozenset({"failed"}),
+    "invalid_worker_command": frozenset({"failed"}),
+    "camera_worker_start_failed": frozenset({"failed"}),
+    "opencv_worker_error": frozenset({"failed"}),
+    "camera_worker_error": frozenset({"failed"}),
+    "invalid_worker_response": frozenset({"failed"}),
+}
+
+
+def normalize_snapshot_reason(value: object) -> SnapshotReasonCode:
+    """Return only a reviewed reason code, replacing untrusted text with generic."""
+
+    if type(value) is str:
+        return _CANONICAL_SNAPSHOT_REASON_CODES.get(value, "generic")
+    return "generic"
+
+
+def normalize_snapshot_reason_for_outcome(
+    value: object,
+    *,
+    outcome: str,
+) -> SnapshotReasonCode:
+    """Normalize a reason and replace semantically incompatible codes with generic."""
+
+    normalized = normalize_snapshot_reason(value)
+    if normalized == "generic":
+        return normalized
+    if outcome not in _SNAPSHOT_REASON_OUTCOMES.get(normalized, frozenset()):
+        return "generic"
+    return normalized
+
+
+def _validate_snapshot_reason_for_outcome(
+    outcome: str,
+    reason_code: SnapshotReasonCode | None,
+    *,
+    allowed_outcomes: frozenset[str],
+) -> None:
+    if reason_code is None:
+        return
+    if reason_code == "generic":
+        if outcome not in allowed_outcomes - {"ok"}:
+            raise ValueError("generic reason_code requires a non-ok snapshot outcome")
+        return
+    if outcome not in _SNAPSHOT_REASON_OUTCOMES.get(reason_code, frozenset()):
+        raise ValueError("reason_code is incompatible with snapshot outcome")
 
 
 def _require_bounded_integer(
@@ -293,15 +441,27 @@ class SnapshotCaptureResult:
 
     outcome: SnapshotCaptureOutcome
     snapshot: SnapshotEnvelope | None = None
+    reason_code: SnapshotReasonCode | None = None
 
     def __post_init__(self) -> None:
-        if self.outcome not in {"ok", "busy", "timeout", "closed", "unavailable", "failed"}:
+        if self.outcome not in _CAPTURE_OUTCOMES:
             raise ValueError("unsupported snapshot capture outcome")
+        normalized_reason = (
+            None if self.reason_code is None else normalize_snapshot_reason(self.reason_code)
+        )
+        object.__setattr__(self, "reason_code", normalized_reason)
         if self.outcome == "ok":
             if not isinstance(self.snapshot, SnapshotEnvelope):
                 raise TypeError("ok snapshot capture requires a SnapshotEnvelope")
+            if normalized_reason is not None:
+                raise ValueError("ok snapshot capture must not include a reason_code")
         elif self.snapshot is not None:
             raise ValueError("non-ok snapshot capture must not expose a snapshot")
+        _validate_snapshot_reason_for_outcome(
+            self.outcome,
+            normalized_reason,
+            allowed_outcomes=_CAPTURE_OUTCOMES,
+        )
 
 
 @runtime_checkable
@@ -390,13 +550,31 @@ class AgentObservationResult:
         return None if self.outcome == "ok" else self.outcome
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class AgentSnapshotResult:
     """One encoded still-image result; raw frame contracts cannot appear here."""
 
     outcome: AgentSnapshotOutcome
-    snapshot: SnapshotEnvelope | None = None
-    contract: Literal["urn:viskium:agent-read:1"] = AGENT_READ_CONTRACT
+    snapshot: SnapshotEnvelope | None
+    contract: Literal["urn:viskium:agent-read:1"]
+    _explicit_reason_code: SnapshotReasonCode | None = field(default=None, repr=False)
+
+    def __init__(
+        self,
+        outcome: AgentSnapshotOutcome,
+        snapshot: SnapshotEnvelope | None = None,
+        contract: Literal["urn:viskium:agent-read:1"] = AGENT_READ_CONTRACT,
+        reason_code: SnapshotReasonCode | None = None,
+    ) -> None:
+        object.__setattr__(self, "outcome", outcome)
+        object.__setattr__(self, "snapshot", snapshot)
+        object.__setattr__(self, "contract", contract)
+        object.__setattr__(
+            self,
+            "_explicit_reason_code",
+            None if reason_code is None else normalize_snapshot_reason(reason_code),
+        )
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         if self.contract != AGENT_READ_CONTRACT:
@@ -406,12 +584,29 @@ class AgentSnapshotResult:
         if self.outcome == "ok":
             if not isinstance(self.snapshot, SnapshotEnvelope):
                 raise TypeError("ok snapshot result requires a SnapshotEnvelope")
+            if self._explicit_reason_code is not None:
+                raise ValueError("ok snapshot result must not include a reason_code")
         elif self.snapshot is not None:
             raise ValueError("non-ok snapshot result must not expose a snapshot")
+        _validate_snapshot_reason_for_outcome(
+            self.outcome,
+            self._explicit_reason_code,
+            allowed_outcomes=_SNAPSHOT_OUTCOMES,
+        )
 
     @property
-    def reason_code(self) -> AgentSnapshotOutcome | None:
+    def reason_code(self) -> AgentSnapshotOutcome | SnapshotReasonCode | None:
+        """Return an explicit safe code, or the legacy outcome alias."""
+
+        if self._explicit_reason_code is not None:
+            return self._explicit_reason_code
         return None if self.outcome == "ok" else self.outcome
+
+    @property
+    def explicit_reason_code(self) -> SnapshotReasonCode | None:
+        """Return only an explicitly supplied provider reason, if present."""
+
+        return self._explicit_reason_code
 
 
 @dataclass(frozen=True, slots=True)
@@ -704,7 +899,10 @@ class AgentReadService:
         if capture.outcome != "ok":
             if capture.outcome in {"unavailable", "failed"}:
                 self._count(self._DEPENDENCY_FAILURE)
-            return AgentSnapshotResult(cast(AgentSnapshotOutcome, capture.outcome))
+            return AgentSnapshotResult(
+                cast(AgentSnapshotOutcome, capture.outcome),
+                reason_code=capture.reason_code,
+            )
         snapshot = capture.snapshot
         if snapshot is None:
             self._count(self._DEPENDENCY_FAILURE)
@@ -823,5 +1021,8 @@ __all__ = [
     "SnapshotCaptureOutcome",
     "SnapshotCaptureResult",
     "SnapshotProvider",
+    "SnapshotReasonCode",
     "StatusProvider",
+    "normalize_snapshot_reason",
+    "normalize_snapshot_reason_for_outcome",
 ]
