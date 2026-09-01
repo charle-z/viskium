@@ -88,11 +88,12 @@ def _patch_fake_transport(
     class _StartupInfo:
         lpAttributeList: dict[str, object] | None = None
 
-    monkeypatch.setattr(transport.subprocess, "STARTUPINFO", _StartupInfo)
+    monkeypatch.setattr(transport.subprocess, "STARTUPINFO", _StartupInfo, raising=False)
     monkeypatch.setattr(
         transport.os,
         "set_handle_inheritable",
         lambda handle, enabled: inheritable.append((handle, enabled)),
+        raising=False,
     )
 
     def fake_popen(command: list[str], **kwargs: Any) -> Any:
@@ -328,7 +329,7 @@ def test_windows_revoke_failure_retains_child_for_bounded_cleanup(
         if not inheritable:
             raise OSError("private revoke detail")
 
-    monkeypatch.setattr(transport.os, "set_handle_inheritable", fail_revoke)
+    monkeypatch.setattr(transport.os, "set_handle_inheritable", fail_revoke, raising=False)
 
     with pytest.raises(SocketSubprocessLaunchError) as caught:
         transport.launch_socket_subprocess("viskium._camera_worker_subprocess", windows=True)
@@ -355,7 +356,7 @@ def test_enable_failure_still_attempts_inheritance_revocation(
         if enabled:
             raise OSError("private inherit detail")
 
-    monkeypatch.setattr(transport.os, "set_handle_inheritable", fail_enable)
+    monkeypatch.setattr(transport.os, "set_handle_inheritable", fail_enable, raising=False)
 
     with pytest.raises(SocketSubprocessLaunchError) as caught:
         transport.launch_socket_subprocess("viskium._camera_worker_subprocess", windows=True)
