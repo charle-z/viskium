@@ -16,9 +16,35 @@ from collections.abc import Callable, Sequence
 from contextlib import suppress
 from multiprocessing.connection import Connection
 from threading import Lock
-from typing import Any
+from typing import Any, Protocol, cast
 
 _WINDOWS_LAUNCH_LOCK = Lock()
+
+
+class _StartupInfo(Protocol):
+    """Small typed boundary for the Windows-only ``STARTUPINFO`` object."""
+
+    lpAttributeList: dict[str, list[int]]
+
+
+def _set_handle_inheritable(handle: int, inheritable: bool) -> None:
+    """Resolve the Windows-only handle helper without importing it statically."""
+
+    setter = getattr(os, "set_handle_inheritable", None)
+    if not callable(setter):
+        raise RuntimeError("Windows handle inheritance API is unavailable")
+    cast(Callable[[int, bool], None], setter)(handle, inheritable)
+
+
+def _windows_startup_info(handle: int) -> _StartupInfo:
+    """Build a narrow Windows startup attribute list or fail closed."""
+
+    startup_info_factory = getattr(subprocess, "STARTUPINFO", None)
+    if not callable(startup_info_factory):
+        raise RuntimeError("Windows STARTUPINFO API is unavailable")
+    startup_info = cast(Callable[[], _StartupInfo], startup_info_factory)()
+    startup_info.lpAttributeList = {"handle_list": [handle]}
+    return startup_info
 
 
 class SubprocessProcess:
@@ -168,12 +194,11 @@ def launch_socket_subprocess(
             with _WINDOWS_LAUNCH_LOCK:
                 inheritance_attempted = True
                 try:
-                    os.set_handle_inheritable(child_handle, True)
+                    _set_handle_inheritable(child_handle, True)
                     if _deadline_expired(deadline, monotonic):
                         launch_error = RuntimeError("worker launch deadline expired")
                     else:
-                        startupinfo = subprocess.STARTUPINFO()
-                        startupinfo.lpAttributeList = {"handle_list": [child_handle]}
+                        startupinfo = _windows_startup_info(child_handle)
                         kwargs["startupinfo"] = startupinfo
                         creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
                         if creationflags:
@@ -186,7 +211,7 @@ def launch_socket_subprocess(
                 finally:
                     if inheritance_attempted:
                         try:
-                            os.set_handle_inheritable(child_handle, False)
+                            _set_handle_inheritable(child_handle, False)
                         except Exception as error:
                             revoke_error = error
             if revoke_error is not None:
