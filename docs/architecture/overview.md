@@ -60,7 +60,7 @@ SQLite. Integrar ambos caminos exige un composition root adicional y pruebas E2E
 | `ConsentLedger` | Persiste el grant local y su cuota sin guardar bearer tokens ni abrir hardware. |
 | `AgentReadService` | Autoriza y acota status, una observación latest o un snapshot; revalida el grant después de esperar/capturar. |
 | `CameraSnapshotProvider` | Serializa una operación one-shot: admission, open, warmup/read, PNG en RAM y close. No cachea frames ni resultados. |
-| Transporte MCP | Adapta tres operaciones versionadas; no concede permisos, no transmite video y no controla el lifecycle de cámara. |
+| Transporte MCP | Adapta cinco operaciones versionadas; challenge sintético sin consentimiento más lecturas acotadas; no transmite video ni controla el lifecycle de cámara. |
 
 El processor no modifica cámara, consentimiento o almacenamiento. El sampler no degrada componentes
 por sí mismo. El servicio para agentes no crea ni renueva grants.
@@ -172,11 +172,19 @@ jitter, drivers o reconexiones de una cámara física.
 
 ### Agente one-shot
 
-El transporte MCP opcional expone exactamente:
+El transporte MCP opcional expone exactamente cinco tools, separadas en tres
+lecturas/capturas de cámara y dos operaciones sintéticas de challenge:
+
+Herramientas de cámara/lectura:
 
 - `viskium_status_v1`: status público acotado, sin consentimiento ni hardware.
 - `viskium_latest_observation_v1`: como máximo una observación bajo grant existente.
 - `viskium_snapshot_v1`: como máximo un PNG one-shot bajo grant y cuota existentes.
+
+Herramientas sintéticas de challenge:
+
+- `viskium_vision_challenge_v1`: emite una imagen sintética y un recibo efímero.
+- `viskium_verify_vision_challenge_v1`: verifica los claims contra ese challenge.
 
 No existe tool para conceder acceso, abrir una sesión continua, mover una cámara o guardar imágenes.
 Las pruebas de software recorren grant, admission, cliente MCP in-memory y cierre del worker con

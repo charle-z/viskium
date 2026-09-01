@@ -68,12 +68,20 @@ puedan conservar fuera del control del proceso.
 
 ## Acceso para agentes
 
-El servidor expone exactamente tres tools versionadas:
+El servidor expone cinco tools versionadas:
 
 - `viskium_status_v1`: configuración y health de cierre mínimos, sin contadores de actividad,
   sin abrir cámara ni exigir consentimiento.
 - `viskium_latest_observation_v1`: última observación fresca y compatible.
 - `viskium_snapshot_v1`: una captura PNG acotada, con apertura y cierre en la misma llamada.
+- `viskium_vision_challenge_v1`: una imagen sintética efímera para comprobar la ruta visual del
+  modelo, sin abrir cámara ni guardar la imagen.
+- `viskium_verify_vision_challenge_v1`: valida los claims mostrados por el modelo y consume un
+  único intento; nunca revela los valores esperados.
+
+La prueba de challenge no demuestra por sí sola que la interfaz del host haya renderizado la
+imagen. Consulta la [guía de integración con OpenCode](docs/integrations/opencode.md) para el
+prompt exacto y el proof card visible.
 
 La superficie MCP no ofrece tools para otorgar consentimiento, abrir una sesión continua ni
 administrar el lifecycle de cámara. El usuario prepara la raíz y concede scopes fuera del

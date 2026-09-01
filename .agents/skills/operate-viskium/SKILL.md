@@ -7,12 +7,15 @@ description: Use local Viskium MCP tools to inspect bounded status, read one str
 
 Use only the public Viskium MCP tools. The server owns the camera handle; do not open the camera through shell commands, OpenCV scripts, browser APIs, or another tool while Viskium is serving it.
 
-Before the first call, confirm that the three Viskium tools are available. A fresh clone keeps the
-project MCP server disabled; an unavailable or disabled server means the tools are absent for this
-task. In that case, stop instead of substituting another camera path, a CLI capture, or a generic
-camera tool. Explain that the user must prepare the environment and data root, grant consent, set
-`mcp_servers.viskium.enabled = true` in `.codex/config.toml`, trust the project, and restart the
-Codex host. Do not perform those setup or consent actions merely to satisfy the request.
+Before the first camera call, confirm that the five Viskium tools are available. A fresh clone keeps
+the project MCP server disabled; an unavailable or disabled server means the camera tools are absent
+for this task. In that case, stop instead of substituting another camera path, a CLI capture, or a
+generic camera tool. Explain that the user must prepare the environment and data root, grant
+consent, set `mcp_servers.viskium.enabled = true` in `.codex/config.toml`, trust the project, and
+restart the Codex host. Do not perform those setup or consent actions merely to satisfy the request.
+
+`viskium_vision_challenge_v1` and `viskium_verify_vision_challenge_v1` are synthetic, bounded
+challenge tools. They do not require consent, open the camera, or replace the camera ordering below.
 
 1. Call `viskium_status_v1` first. This call is read-only and must not open the camera.
 2. Prefer `viskium_latest_observation_v1` when a structured observation can answer the request and status reports a configured producer. If status reports `producer: not_configured`, skip this tool because the current server cannot populate it. Keep `wait_ms` and `max_age_ms` no larger than the task needs.

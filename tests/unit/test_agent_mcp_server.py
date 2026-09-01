@@ -30,6 +30,8 @@ from viskium.agent.mcp_server import (
     LATEST_OBSERVATION_TOOL_V1,
     SNAPSHOT_TOOL_V1,
     STATUS_TOOL_V1,
+    VERIFY_VISION_CHALLENGE_TOOL_V1,
+    VISION_CHALLENGE_TOOL_V1,
     MCPDependencyError,
     create_mcp_server,
 )
@@ -189,11 +191,15 @@ def test_lists_exact_versioned_tools_with_safe_annotations_and_effective_limits(
         STATUS_TOOL_V1,
         LATEST_OBSERVATION_TOOL_V1,
         SNAPSHOT_TOOL_V1,
+        VISION_CHALLENGE_TOOL_V1,
+        VERIFY_VISION_CHALLENGE_TOOL_V1,
     }
 
     status = _tool_by_name(listing, STATUS_TOOL_V1)
     latest = _tool_by_name(listing, LATEST_OBSERVATION_TOOL_V1)
     snapshot = _tool_by_name(listing, SNAPSHOT_TOOL_V1)
+    challenge = _tool_by_name(listing, VISION_CHALLENGE_TOOL_V1)
+    verify = _tool_by_name(listing, VERIFY_VISION_CHALLENGE_TOOL_V1)
     assert status.annotations.model_dump(by_alias=True) == {
         "title": None,
         "readOnlyHint": True,
@@ -224,6 +230,17 @@ def test_lists_exact_versioned_tools_with_safe_annotations_and_effective_limits(
     assert status.output_schema is not None
     assert latest.output_schema is not None
     assert snapshot.output_schema is None
+    assert challenge.input_schema["properties"] == {}
+    assert challenge.output_schema is None
+    assert verify.input_schema["required"] == [
+        "challenge_id",
+        "image_sha256",
+        "token",
+        "shape_a",
+        "shape_b",
+        "relation",
+    ]
+    assert verify.output_schema is not None
 
 
 def test_status_is_in_memory_public_and_never_touches_consent_or_camera(

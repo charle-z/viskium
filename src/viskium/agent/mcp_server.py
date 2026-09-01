@@ -1,8 +1,8 @@
 """Optional MCP v2 transport for Viskium's bounded agent-read service.
 
-The transport deliberately exposes only three versioned tools. Consent is
-managed out of band by :class:`~viskium.agent.service.AgentReadService`; this
-module cannot create grants, stream frames, or control camera lifecycle.
+The transport deliberately exposes five versioned tools. Consent is managed
+out of band by :class:`~viskium.agent.service.AgentReadService`; the challenge
+tools are synthetic and do not create grants, open cameras, or stream frames.
 """
 
 from __future__ import annotations
@@ -16,6 +16,12 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Annotated, Any, BinaryIO, Literal, NotRequired, TypedDict, cast
 
 from viskium.agent.service import AgentReadService, SnapshotReasonCode
+from viskium.agent.vision_challenge import (
+    VERIFY_VISION_CHALLENGE_TOOL_V1,
+    VISION_CHALLENGE_TOOL_V1,
+    VisionChallengeCapacityError,
+    VisionChallengeService,
+)
 from viskium.core.serialization import bounded_canonical_json_bytes
 
 if TYPE_CHECKING:
@@ -76,6 +82,20 @@ class SnapshotFailureResult(TypedDict):
     agent_contract: Literal["urn:viskium:agent-read:1"]
     outcome: str
     reason_code: NotRequired[SnapshotReasonCode]
+
+
+class VisionProofResult(TypedDict):
+    """Stable structured proof shape; it deliberately has no expected claims."""
+
+    contract: Literal["urn:viskium:mcp:vision-proof:1"]
+    outcome: Literal["PASS", "FAIL", "rejected"]
+    challenge_id: str
+    image_sha256: str
+    width: int
+    height: int
+    byte_count: int
+    attempts_used: int
+    claims_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,6 +360,10 @@ def create_mcp_server(service: AgentReadService) -> MCPServer[Any]:
         STATUS_TOOL_V1: frozenset(),
         LATEST_OBSERVATION_TOOL_V1: frozenset({"max_age_ms", "wait_ms", "schema_ids"}),
         SNAPSHOT_TOOL_V1: frozenset({"max_edge_px", "wait_ms"}),
+        VISION_CHALLENGE_TOOL_V1: frozenset(),
+        VERIFY_VISION_CHALLENGE_TOOL_V1: frozenset(
+            {"challenge_id", "image_sha256", "token", "shape_a", "shape_b", "relation"}
+        ),
     }
 
     def rejected_request(reason: str) -> Any:
@@ -384,16 +408,17 @@ def create_mcp_server(service: AgentReadService) -> MCPServer[Any]:
     server = sdk.server_type(
         name=MCP_SERVER_NAME,
         title="Viskium bounded agent reads",
-        description="Bounded status, latest-observation, and one-shot PNG access.",
+        description="Bounded status, observation, snapshot, and synthetic visual challenge access.",
         instructions=(
-            "Use only the three versioned tools. Consent is out of band; no tool grants "
-            "access, streams frames, or controls camera lifecycle."
+            "Use only the five versioned tools. Consent is out of band for camera snapshots; "
+            "challenge tools are synthetic and do not require consent or camera access."
         ),
         version=MCP_SERVER_VERSION,
         debug=False,
         log_level="ERROR",
         middleware=[strict_tool_inputs],
     )
+    vision_challenges = VisionChallengeService()
 
     read_annotations = sdk.annotations_type(
         readOnlyHint=True,
@@ -511,6 +536,67 @@ def create_mcp_server(service: AgentReadService) -> MCPServer[Any]:
             structured_content=metadata,
         )
 
+    def vision_challenge_v1() -> Any:
+        """Return one ephemeral synthetic visual challenge and metadata receipt."""
+
+        try:
+            issued = vision_challenges.issue()
+        except VisionChallengeCapacityError as error:
+            raise sdk.tool_error_type("visual challenge unavailable") from error
+        receipt = issued.receipt.to_dict()
+        receipt_bytes = bounded_canonical_json_bytes(
+            receipt,
+            max_bytes=limits.max_metadata_bytes,
+        )
+        if receipt_bytes is None:
+            raise sdk.tool_error_type("invalid visual challenge result")
+        image_content = sdk.image_type(
+            data=issued.snapshot.png_bytes,
+            format="png",
+        ).to_image_content()
+        receipt_content = sdk.text_content_type(
+            type="text",
+            text=receipt_bytes.decode("utf-8"),
+        )
+        return sdk.call_tool_result_type(
+            content=[image_content, receipt_content],
+            structured_content=receipt,
+        )
+
+    def verify_vision_challenge_v1(
+        challenge_id: object,
+        image_sha256: object,
+        token: object,
+        shape_a: object,
+        shape_b: object,
+        relation: object,
+    ) -> Any:
+        """Verify one caller-provided visual claim and consume its single attempt."""
+
+        proof = vision_challenges.verify(
+            challenge_id=challenge_id,
+            image_sha256=image_sha256,
+            token=token,
+            shape_a=shape_a,
+            shape_b=shape_b,
+            relation=relation,
+        ).to_dict()
+        proof_bytes = bounded_canonical_json_bytes(
+            proof,
+            max_bytes=limits.max_metadata_bytes,
+        )
+        if proof_bytes is None:
+            raise sdk.tool_error_type("invalid visual challenge proof")
+        return sdk.call_tool_result_type(
+            content=[
+                sdk.text_content_type(
+                    type="text",
+                    text=proof_bytes.decode("utf-8"),
+                )
+            ],
+            structured_content=proof,
+        )
+
     field = sdk.field
     schema_id = Annotated[
         str,
@@ -547,6 +633,18 @@ def create_mcp_server(service: AgentReadService) -> MCPServer[Any]:
         }
     )
     snapshot_v1.__defaults__ = (snapshot_default_wait_ms,)
+    vision_challenge_v1.__annotations__.update({"return": Any})
+    verify_vision_challenge_v1.__annotations__.update(
+        {
+            "challenge_id": str,
+            "image_sha256": object,
+            "token": object,
+            "shape_a": object,
+            "shape_b": object,
+            "relation": object,
+            "return": VisionProofResult,
+        }
+    )
 
     server.add_tool(
         status_v1,
@@ -579,6 +677,28 @@ def create_mcp_server(service: AgentReadService) -> MCPServer[Any]:
         ),
         annotations=snapshot_annotations,
         structured_output=False,
+    )
+    server.add_tool(
+        vision_challenge_v1,
+        name=VISION_CHALLENGE_TOOL_V1,
+        title="Viskium visual challenge v1",
+        description=(
+            "Create one bounded synthetic visual challenge image with an ephemeral receipt. "
+            "The image is available only in this response."
+        ),
+        annotations=snapshot_annotations,
+        structured_output=False,
+    )
+    server.add_tool(
+        verify_vision_challenge_v1,
+        name=VERIFY_VISION_CHALLENGE_TOOL_V1,
+        title="Viskium visual challenge verification v1",
+        description=(
+            "Verify one caller-provided claim for a previously issued visual challenge. "
+            "Claims are bounded uppercase values; each challenge accepts one attempt."
+        ),
+        annotations=snapshot_annotations,
+        structured_output=True,
     )
     return cast("MCPServer[Any]", server)
 
@@ -667,9 +787,12 @@ __all__ = [
     "SNAPSHOT_TOOL_V1",
     "STATUS_RESULT_CONTRACT_V1",
     "STATUS_TOOL_V1",
+    "VERIFY_VISION_CHALLENGE_TOOL_V1",
+    "VISION_CHALLENGE_TOOL_V1",
     "MCPDependencyError",
     "MCPTransportError",
     "SnapshotFailureResult",
+    "VisionProofResult",
     "create_mcp_server",
     "run_mcp_server",
 ]
