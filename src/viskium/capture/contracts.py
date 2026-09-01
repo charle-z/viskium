@@ -42,6 +42,14 @@ class ReadStatus(StrEnum):
     FATAL_ERROR = "fatal_error"
 
 
+class VideoIOPreference(StrEnum):
+    """Bounded camera API selection for the OpenCV process backend."""
+
+    AUTO = "auto"
+    MEDIA_FOUNDATION = "media_foundation"
+    DIRECTSHOW = "directshow"
+
+
 class CaptureError(RuntimeError):
     """Base class for capture-boundary failures."""
 
@@ -213,6 +221,7 @@ class CaptureRequest:
     requested_height: int
     requested_fps: float
     max_frame_bytes: int
+    videoio_preference: VideoIOPreference = VideoIOPreference.AUTO
 
     def __post_init__(self) -> None:
         _require_integer(self.device_index, "device_index", minimum=0, maximum=1_024)
@@ -242,6 +251,8 @@ class CaptureRequest:
         )
         if self.requested_width * self.requested_height > self.max_frame_bytes:
             raise ValueError("requested mode cannot fit inside max_frame_bytes")
+        if type(self.videoio_preference) is not VideoIOPreference:
+            raise TypeError("videoio_preference must be a VideoIOPreference")
 
 
 def default_capture_request(device_index: int = 0) -> CaptureRequest:
@@ -374,6 +385,7 @@ __all__ = [
     "DeadlineCapability",
     "NegotiatedStream",
     "ReadStatus",
+    "VideoIOPreference",
     "default_camera_policy",
     "default_capture_request",
 ]

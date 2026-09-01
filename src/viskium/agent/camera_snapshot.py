@@ -566,7 +566,14 @@ class CameraSnapshotProvider:
                 reason = _safe_capture_open_reason(error)
                 result = (
                     self._timeout(reason)
-                    if reason == "camera_open_timeout"
+                    if reason
+                    in {
+                        "camera_worker_start_timeout",
+                        "camera_backend_init_timeout",
+                        "camera_device_open_timeout",
+                        "camera_open_timeout",
+                        "camera_configure_timeout",
+                    }
                     else SnapshotCaptureResult("unavailable", reason_code=reason)
                 )
             except Exception:

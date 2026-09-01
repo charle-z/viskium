@@ -15,6 +15,7 @@ from viskium.capture import (
     DeadlineCapability,
     NegotiatedStream,
     ReadStatus,
+    VideoIOPreference,
     default_camera_policy,
     default_capture_request,
 )
@@ -129,6 +130,7 @@ def test_capture_request_and_negotiated_stream_are_bounded() -> None:
     stream = NegotiatedStream("fake", 640, 480, 15.0, "GRAY8", 640)
 
     assert request.requested_width == stream.width
+    assert request.videoio_preference is VideoIOPreference.AUTO
     assert stream.stride * stream.height < request.max_frame_bytes
 
 
@@ -176,6 +178,11 @@ def test_capture_request_rejects_invalid_modes(overrides: dict[str, Any]) -> Non
     values.update(overrides)
     with pytest.raises((TypeError, ValueError)):
         CaptureRequest(**values)
+
+
+def test_capture_request_rejects_unbounded_videoio_preference() -> None:
+    with pytest.raises(TypeError, match="VideoIOPreference"):
+        CaptureRequest(0, 2, 2, 15.0, 16, videoio_preference="auto")  # type: ignore[arg-type]
 
 
 def test_backend_frame_and_read_result_enforce_tagged_union() -> None:

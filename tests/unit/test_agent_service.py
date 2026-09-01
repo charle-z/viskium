@@ -871,6 +871,7 @@ def test_snapshot_reason_codes_are_canonical_and_semantically_bounded() -> None:
             raise AssertionError("reason normalization must not compare subclasses")
 
     assert normalize_snapshot_reason("device_open_failed") == "device_open_failed"
+    assert normalize_snapshot_reason("camera_configure_timeout") == "camera_configure_timeout"
     assert normalize_snapshot_reason(MaliciousString("device_open_failed")) == "generic"
     assert normalize_snapshot_reason(r"driver failure at C:\\private") == "generic"
 
@@ -887,6 +888,8 @@ def test_snapshot_reason_codes_are_canonical_and_semantically_bounded() -> None:
 
     with pytest.raises(ValueError, match="incompatible"):
         SnapshotCaptureResult("timeout", reason_code="device_open_failed")
+    with pytest.raises(ValueError, match="incompatible"):
+        SnapshotCaptureResult("unavailable", reason_code="camera_configure_timeout")
     with pytest.raises(ValueError, match="incompatible"):
         AgentSnapshotResult("failed", reason_code="device_open_failed")
     with pytest.raises(ValueError, match="must not include"):

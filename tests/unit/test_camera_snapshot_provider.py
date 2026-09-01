@@ -553,6 +553,18 @@ def test_camera_open_timeout_is_a_timeout_with_a_safe_reason() -> None:
     assert backend.close_calls == 1
 
 
+def test_camera_configure_timeout_is_a_timeout_with_a_safe_reason() -> None:
+    backend = ScriptedBackend([], open_error=CaptureOpenError("camera_configure_timeout"))
+    provider = _provider(BackendFactory([backend]))
+
+    result = _capture(provider)
+
+    assert result.outcome == "timeout"
+    assert result.reason_code == "camera_configure_timeout"
+    assert provider.metrics.timeouts == 1
+    assert backend.close_calls == 1
+
+
 def test_open_error_reason_extraction_never_calls_error_str() -> None:
     class MaliciousOpenError(CaptureOpenError):
         def __str__(self) -> str:

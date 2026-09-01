@@ -15,6 +15,7 @@ from .contracts import (
     DeadlineCapability,
     NegotiatedStream,
     ReadStatus,
+    VideoIOPreference,
     default_camera_policy,
     default_capture_request,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "OfferStatus",
     "ReadStatus",
     "ResourceAdmission",
+    "VideoIOPreference",
     "default_camera_policy",
     "default_capture_request",
 ]

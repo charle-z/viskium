@@ -8,6 +8,8 @@ starts a stream, retries, displays the image, or writes image bytes to disk.
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -15,7 +17,7 @@ from typing import Any
 import anyio
 import pytest
 from mcp import Client
-from mcp.types import ImageContent
+from mcp.types import ImageContent, TextContent
 
 from viskium.adapters.opencv_process_camera import (
     OpenCVProcessCameraBackend,
@@ -72,13 +74,28 @@ def test_default_camera_can_deliver_one_ephemeral_png_through_mcp(tmp_path: Path
     result = anyio.run(scenario)
 
     assert not result.is_error
-    assert len(result.content) == 1
-    image = result.content[0]
+    assert len(result.content) == 2
+    image, receipt = result.content
     assert isinstance(image, ImageContent)
+    assert isinstance(receipt, TextContent)
     assert image.mime_type == "image/png"
     png_bytes = base64.b64decode(image.data, validate=True)
     assert png_bytes.startswith(PNG_SIGNATURE)
     assert len(png_bytes) <= application.service.limits.max_snapshot_bytes
+    metadata = json.loads(receipt.text)
+    assert metadata == result.structured_content
+    assert metadata == {
+        "contract": "urn:viskium:mcp:snapshot:1",
+        "agent_contract": "urn:viskium:agent-read:1",
+        "outcome": "captured",
+        "status": "captured",
+        "schema_version": 1,
+        "mime_type": "image/png",
+        "width": 640,
+        "height": 480,
+        "byte_count": len(png_bytes),
+        "sha256": hashlib.sha256(png_bytes).hexdigest(),
+    }
 
     state = consent.load()
     assert state is not None

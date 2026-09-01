@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import multiprocessing
+import os
 import time
 from collections.abc import Callable
 from contextlib import suppress
@@ -11,6 +13,13 @@ from multiprocessing.connection import Connection
 from threading import get_ident
 from typing import Any, Protocol, runtime_checkable
 
+from viskium._camera_worker_bootstrap import _camera_worker_bootstrap
+from viskium._worker_transport import (
+    SocketSubprocessLaunchError,
+)
+from viskium._worker_transport import (
+    launch_socket_subprocess as _launch_socket_subprocess,
+)
 from viskium.capture import (
     BackendFrame,
     CaptureCapabilities,
@@ -23,11 +32,41 @@ from viskium.capture import (
     DeadlineCapability,
     NegotiatedStream,
     ReadStatus,
+    VideoIOPreference,
 )
+from viskium.capture.contracts import MAX_CAPTURE_DIMENSION, MAX_CAPTURE_FPS
 
-_MAX_REASON_CHARS = 128
 _DEFAULT_CLEANUP_SECONDS = 0.25
 _MAX_INT64 = 2**63 - 1
+
+_OPEN_REASON_CODES = frozenset(
+    {
+        "opencv_unavailable",
+        "device_open_failed",
+        "opencv_worker_error",
+        "directshow_unavailable",
+        "mediafoundation_unavailable",
+        "videoio_backend_unavailable",
+        "invalid_backend_preference",
+        "busy",
+    }
+)
+_CONFIGURE_REASON_CODES = frozenset(
+    {
+        "camera_configure_failed",
+        "negotiated_mode_exceeds_limit",
+    }
+)
+_READ_REASON_CODES = frozenset(
+    {
+        "capture_read_error",
+        "capture_read_failed",
+        "camera_worker_error",
+        "camera_worker_disconnected",
+        "invalid_worker_command",
+        "invalid_backend_frame",
+    }
+)
 
 
 class OpenCVWorkerState(StrEnum):
@@ -73,10 +112,64 @@ class _ProcessContextPort(Protocol):
     def Process(self, **kwargs: object) -> _ProcessPort: ...
 
 
-def _reason(value: object, fallback: str) -> str:
-    if not isinstance(value, str) or not value or not value.strip():
+def _reason(value: object, fallback: str, allowed: frozenset[str]) -> str:
+    if type(value) is not str or value not in allowed:
         return fallback
-    return value[:_MAX_REASON_CHARS]
+    return value
+
+
+def _select_videoio_api(
+    cv2: Any,
+    preference: VideoIOPreference,
+    *,
+    platform_name: str | None = None,
+) -> int:
+    """Select one available OpenCV API without opening a device or falling back."""
+
+    if type(preference) is not VideoIOPreference:
+        raise TypeError("videoio preference must be a VideoIOPreference")
+    selected_platform = os.name if platform_name is None else platform_name
+    if selected_platform != "nt":
+        if preference is not VideoIOPreference.AUTO:
+            reason = (
+                "mediafoundation_unavailable"
+                if preference is VideoIOPreference.MEDIA_FOUNDATION
+                else "directshow_unavailable"
+            )
+            raise RuntimeError(reason)
+        api = getattr(cv2, "CAP_ANY", 0)
+        if isinstance(api, bool) or not isinstance(api, int):
+            raise RuntimeError("videoio_backend_unavailable")
+        return api
+
+    def available_api(attribute: str, reason: str) -> int:
+        api = getattr(cv2, attribute, None)
+        if isinstance(api, bool) or not isinstance(api, int):
+            raise RuntimeError(reason)
+        registry = getattr(cv2, "videoio_registry", None)
+        has_backend = getattr(registry, "hasBackend", None)
+        if not callable(has_backend):
+            raise RuntimeError(reason)
+        try:
+            available = has_backend(api)
+        except Exception as error:
+            raise RuntimeError(reason) from error
+        if type(available) is not bool or not available:
+            raise RuntimeError(reason)
+        return api
+
+    if preference is VideoIOPreference.MEDIA_FOUNDATION:
+        return available_api("CAP_MSMF", "mediafoundation_unavailable")
+    if preference is VideoIOPreference.DIRECTSHOW:
+        return available_api("CAP_DSHOW", "directshow_unavailable")
+
+    # AUTO has one deterministic Windows order.  The first available backend
+    # is selected before the worker calls VideoCapture; a failed open is not a
+    # reason to open the device a second time through another API.
+    try:
+        return available_api("CAP_MSMF", "mediafoundation_unavailable")
+    except RuntimeError:
+        return available_api("CAP_DSHOW", "directshow_unavailable")
 
 
 def _remaining_seconds(deadline_ns: int, monotonic_ns: Callable[[], int]) -> float:
@@ -101,16 +194,63 @@ def _send_worker_message(connection: _ConnectionPort, message: tuple[object, ...
         connection.send(message)
 
 
-def _opencv_worker(connection: Connection, request: CaptureRequest) -> None:  # pragma: no cover
-    """Import OpenCV only inside the isolated worker process."""
+def _process_has_exited(process: _ProcessPort | None) -> bool:
+    """Return only a bounded exit fact; never expose process details."""
 
+    if process is None:
+        return False
     try:
-        import cv2
-    except (ImportError, OSError):
-        _send_worker_message(connection, ("open_error", "opencv_unavailable"))
-        connection.close()
-        return
-    _run_worker(connection, request, cv2)
+        alive = process.is_alive()
+    except (AssertionError, OSError, ValueError):
+        alive = None
+    if alive is False:
+        return True
+    if alive is True:
+        return False
+    try:
+        exitcode = getattr(process, "exitcode", None)
+    except (AssertionError, OSError, ValueError):
+        return False
+    return exitcode is not None
+
+
+def _receive_worker_message(
+    connection: _ConnectionPort,
+    *,
+    process: _ProcessPort | None = None,
+    deadline_monotonic_ns: int,
+    monotonic_ns: Callable[[], int],
+    timeout_reason: str,
+    invalid_reason: str,
+) -> object:
+    """Receive exactly one bounded worker message under one absolute deadline."""
+
+    remaining = _remaining_seconds(deadline_monotonic_ns, monotonic_ns)
+    if remaining <= 0.0:
+        if _process_has_exited(process):
+            raise CaptureOpenError("camera_worker_exited")
+        raise CaptureOpenError(timeout_reason)
+    try:
+        if not connection.poll(remaining):
+            if _process_has_exited(process):
+                raise CaptureOpenError("camera_worker_exited")
+            raise CaptureOpenError(timeout_reason)
+        message = connection.recv()
+        if _remaining_seconds(deadline_monotonic_ns, monotonic_ns) <= 0.0:
+            raise CaptureOpenError(timeout_reason)
+        return message
+    except CaptureOpenError:
+        raise
+    except (BrokenPipeError, EOFError, OSError, TypeError, ValueError) as error:
+        if _process_has_exited(process):
+            raise CaptureOpenError("camera_worker_exited") from error
+        raise CaptureOpenError(invalid_reason) from error
+
+
+def _opencv_worker(connection: Connection, request: CaptureRequest) -> None:  # pragma: no cover
+    """Compatibility wrapper for the private lightweight bootstrap target."""
+
+    _camera_worker_bootstrap(connection, request)
 
 
 def _run_worker(connection: _ConnectionPort, request: CaptureRequest, cv2: Any) -> None:
@@ -118,22 +258,50 @@ def _run_worker(connection: _ConnectionPort, request: CaptureRequest, cv2: Any) 
 
     capture: Any = None
     try:
-        capture = cv2.VideoCapture(request.device_index)
+        try:
+            api = _select_videoio_api(cv2, request.videoio_preference)
+        except RuntimeError as error:
+            reason = _reason(
+                error.args[0] if error.args else None,
+                "videoio_backend_unavailable",
+                _OPEN_REASON_CODES,
+            )
+            _send_worker_message(connection, ("open_error", reason))
+            return
+        except (TypeError, ValueError):
+            _send_worker_message(connection, ("open_error", "invalid_backend_preference"))
+            return
+        # The backend has been selected without opening the device.  Keep the
+        # selected API in the bounded protocol so the parent can validate the
+        # exact phase and type without exposing driver details.
+        _send_worker_message(connection, ("backend_ready", api))
+        capture = cv2.VideoCapture(request.device_index, api)
         if capture is None or not bool(capture.isOpened()):
             _send_worker_message(connection, ("open_error", "device_open_failed"))
             return
-        capture.set(cv2.CAP_PROP_FRAME_WIDTH, float(request.requested_width))
-        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(request.requested_height))
-        capture.set(cv2.CAP_PROP_FPS, request.requested_fps)
+        # This ACK is deliberately before all set/get calls.  The parent can
+        # therefore distinguish a device-open deadline from configuration.
+        _send_worker_message(connection, ("opened",))
+        try:
+            # OpenCV backends commonly report False for an accepted best-effort
+            # request.  The subsequent get() values are the negotiated truth.
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, float(request.requested_width))
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(request.requested_height))
+            capture.set(cv2.CAP_PROP_FPS, request.requested_fps)
 
-        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)) or request.requested_width
-        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)) or request.requested_height
-        fps_value = float(capture.get(cv2.CAP_PROP_FPS))
-        fps = fps_value if 0.0 < fps_value <= 240.0 else None
-        if width <= 0 or height <= 0 or width * height * 3 > request.max_frame_bytes:
-            _send_worker_message(connection, ("open_error", "negotiated_mode_exceeds_limit"))
+            width = _worker_dimension(capture.get(cv2.CAP_PROP_FRAME_WIDTH), "width")
+            height = _worker_dimension(capture.get(cv2.CAP_PROP_FRAME_HEIGHT), "height")
+            fps = _worker_negotiated_fps(capture.get(cv2.CAP_PROP_FPS))
+            if width <= 0 or height <= 0 or width * height * 3 > request.max_frame_bytes:
+                _send_worker_message(
+                    connection,
+                    ("configure_error", "negotiated_mode_exceeds_limit"),
+                )
+                return
+        except Exception:
+            _send_worker_message(connection, ("configure_error", "camera_configure_failed"))
             return
-        _send_worker_message(connection, ("opened", width, height, fps, width * 3))
+        _send_worker_message(connection, ("configured", width, height, fps, width * 3))
 
         while True:
             try:
@@ -214,6 +382,10 @@ class OpenCVProcessCameraBackend:
         ):
             raise ValueError("cleanup_timeout_seconds must be between 0.01 and 2")
         self._context = selected_context
+        # A caller-supplied context is intentionally treated as a test/fake or
+        # an explicit POSIX transport.  The production Windows default uses a
+        # narrow socketpair + handle-list subprocess boundary.
+        self._use_windows_subprocess = context is None and os.name == "nt"
         self._monotonic_ns = monotonic_ns
         self._cleanup_timeout_seconds = float(cleanup_timeout_seconds)
         self._owner_thread_id: int | None = None
@@ -221,6 +393,7 @@ class OpenCVProcessCameraBackend:
         self._connection: _ConnectionPort | None = None
         self._request: CaptureRequest | None = None
         self._stream: NegotiatedStream | None = None
+        self._process_started = False
         self._termination_failed = False
 
     @property
@@ -273,47 +446,212 @@ class OpenCVProcessCameraBackend:
             raise CaptureDeadlineExceeded("camera open deadline expired")
 
         try:
-            parent, child = self._context.Pipe(duplex=True)
-            process = self._context.Process(
-                target=_opencv_worker,
-                args=(child, request),
-                name="viskium-opencv-camera",
-                daemon=True,
+            child: _ConnectionPort | None = None
+            parent: _ConnectionPort
+            process: _ProcessPort
+            if self._use_windows_subprocess:
+                try:
+                    parent, process = _launch_socket_subprocess(
+                        "viskium._camera_worker_subprocess",
+                        deadline=deadline_monotonic_ns,
+                        monotonic=self._monotonic_ns,
+                    )
+                except SocketSubprocessLaunchError as error:
+                    self._connection = error.connection
+                    self._process = error.process
+                    self._request = request if error.process is not None else None
+                    self._process_started = error.process is not None
+                    self._termination_failed = False
+                    self._terminate_worker()
+                    raise CaptureOpenError(error.reason) from error
+                self._process = process
+                self._connection = parent
+                self._request = request
+                self._process_started = True
+                self._termination_failed = False
+            else:
+                parent, child = self._context.Pipe(duplex=True)
+                try:
+                    process = self._context.Process(
+                        target=_camera_worker_bootstrap,
+                        args=(child, request),
+                        name="viskium-opencv-camera",
+                        daemon=True,
+                    )
+                except Exception as error:
+                    with suppress(OSError):
+                        parent.close()
+                    with suppress(OSError):
+                        child.close()
+                    raise CaptureOpenError("camera_worker_start_failed") from error
+                self._process = process
+                self._connection = parent
+                self._request = request
+                self._termination_failed = False
+                try:
+                    process.start()
+                except Exception as error:
+                    with suppress(OSError):
+                        child.close()
+                    self._terminate_worker()
+                    raise CaptureOpenError("camera_worker_start_failed") from error
+                else:
+                    self._process_started = True
+                    with suppress(OSError):
+                        child.close()
+            message = _receive_worker_message(
+                parent,
+                process=process,
+                deadline_monotonic_ns=deadline_monotonic_ns,
+                monotonic_ns=self._monotonic_ns,
+                timeout_reason="camera_worker_start_timeout",
+                invalid_reason="invalid_open_response",
             )
-            self._process = process
-            self._connection = parent
-            self._request = request
-            self._termination_failed = False
-            try:
-                process.start()
-            finally:
-                with suppress(OSError):
-                    child.close()
-            remaining = _remaining_seconds(deadline_monotonic_ns, self._monotonic_ns)
-            if remaining <= 0.0 or not parent.poll(remaining):
-                self._terminate_worker()
-                raise CaptureOpenError("camera_open_timeout")
-            message = parent.recv()
-            if not isinstance(message, tuple) or not message:
+            if type(message) is not tuple or message != ("worker_started",):
                 self._terminate_worker()
                 raise CaptureOpenError("invalid_open_response")
-            if message[0] != "opened" or len(message) != 5:
-                reason = _reason(message[1] if len(message) > 1 else None, "camera_open_failed")
+
+            if self._use_windows_subprocess:
+                if _remaining_seconds(deadline_monotonic_ns, self._monotonic_ns) <= 0.0:
+                    self._terminate_worker()
+                    raise CaptureOpenError("camera_worker_start_timeout")
+                try:
+                    parent.send(("request", request))
+                except (BrokenPipeError, EOFError, OSError, TypeError, ValueError) as error:
+                    self._terminate_worker()
+                    raise CaptureOpenError("camera_worker_start_failed") from error
+                if _remaining_seconds(deadline_monotonic_ns, self._monotonic_ns) <= 0.0:
+                    self._terminate_worker()
+                    raise CaptureOpenError("camera_worker_start_timeout")
+
+            message = _receive_worker_message(
+                parent,
+                process=process,
+                deadline_monotonic_ns=deadline_monotonic_ns,
+                monotonic_ns=self._monotonic_ns,
+                timeout_reason="camera_backend_init_timeout",
+                invalid_reason="invalid_open_response",
+            )
+            if type(message) is not tuple or not message:
+                self._terminate_worker()
+                raise CaptureOpenError("invalid_open_response")
+            status = message[0]
+            if type(status) is not str:
+                self._terminate_worker()
+                raise CaptureOpenError("invalid_open_response")
+            if status == "open_error":
+                if len(message) != 2:
+                    self._terminate_worker()
+                    raise CaptureOpenError("invalid_open_response")
+                reason = _reason(message[1], "camera_open_failed", _OPEN_REASON_CODES)
                 self._terminate_worker()
                 raise CaptureOpenError(reason)
-            stream = NegotiatedStream(
-                backend_id="opencv-process",
-                width=_worker_integer(message[1], "width"),
-                height=_worker_integer(message[2], "height"),
-                fps=_worker_optional_float(message[3], "fps"),
-                pixel_format="bgr24",
-                stride=_worker_integer(message[4], "stride"),
+            if (
+                status != "backend_ready"
+                or len(message) != 2
+                or isinstance(message[1], bool)
+                or type(message[1]) is not int
+            ):
+                self._terminate_worker()
+                raise CaptureOpenError("invalid_open_response")
+
+            message = _receive_worker_message(
+                parent,
+                process=process,
+                deadline_monotonic_ns=deadline_monotonic_ns,
+                monotonic_ns=self._monotonic_ns,
+                timeout_reason="camera_device_open_timeout",
+                invalid_reason="invalid_open_response",
             )
-            if stream.stride * stream.height > request.max_frame_bytes:
-                raise ValueError("negotiated stream exceeds request budget")
+            if type(message) is not tuple or not message:
+                self._terminate_worker()
+                raise CaptureOpenError("invalid_open_response")
+            status = message[0]
+            if type(status) is not str:
+                self._terminate_worker()
+                raise CaptureOpenError("invalid_open_response")
+            if status == "open_error":
+                if len(message) != 2:
+                    self._terminate_worker()
+                    raise CaptureOpenError("invalid_open_response")
+                reason = _reason(message[1], "camera_open_failed", _OPEN_REASON_CODES)
+                self._terminate_worker()
+                raise CaptureOpenError(reason)
+            if status != "opened" or len(message) != 1:
+                self._terminate_worker()
+                raise CaptureOpenError("invalid_open_response")
+
+            message = _receive_worker_message(
+                parent,
+                process=process,
+                deadline_monotonic_ns=deadline_monotonic_ns,
+                monotonic_ns=self._monotonic_ns,
+                timeout_reason="camera_configure_timeout",
+                invalid_reason="invalid_configure_response",
+            )
+            if type(message) is not tuple or not message:
+                self._terminate_worker()
+                raise CaptureOpenError("invalid_configure_response")
+            status = message[0]
+            if type(status) is not str:
+                self._terminate_worker()
+                raise CaptureOpenError("invalid_configure_response")
+            if status == "configure_error":
+                if len(message) != 2:
+                    self._terminate_worker()
+                    raise CaptureOpenError("invalid_configure_response")
+                reason = _reason(
+                    message[1],
+                    "invalid_configure_response",
+                    _CONFIGURE_REASON_CODES,
+                )
+                self._terminate_worker()
+                raise CaptureOpenError(reason)
+            if status != "configured" or len(message) != 5:
+                self._terminate_worker()
+                raise CaptureOpenError("invalid_configure_response")
+            try:
+                width = _worker_integer(message[1], "width")
+                height = _worker_integer(message[2], "height")
+                fps = _worker_optional_float(message[3], "fps")
+                stride = _worker_integer(message[4], "stride")
+            except (TypeError, ValueError) as error:
+                self._terminate_worker()
+                raise CaptureOpenError("camera_configure_failed") from error
+            if (
+                width <= 0
+                or height <= 0
+                or stride <= 0
+                or stride != width * 3
+                or stride * height > request.max_frame_bytes
+                or (fps is not None and (not math.isfinite(fps) or fps <= 0.0 or fps > 240.0))
+            ):
+                self._terminate_worker()
+                raise CaptureOpenError("camera_configure_failed")
+            if _remaining_seconds(deadline_monotonic_ns, self._monotonic_ns) <= 0.0:
+                self._terminate_worker()
+                raise CaptureOpenError("camera_configure_timeout")
+            try:
+                stream = NegotiatedStream(
+                    backend_id="opencv-process",
+                    width=width,
+                    height=height,
+                    fps=fps,
+                    pixel_format="bgr24",
+                    stride=stride,
+                )
+            except (TypeError, ValueError) as error:
+                self._terminate_worker()
+                raise CaptureOpenError("camera_configure_failed") from error
+            if _remaining_seconds(deadline_monotonic_ns, self._monotonic_ns) <= 0.0:
+                self._terminate_worker()
+                raise CaptureOpenError("camera_configure_timeout")
             self._stream = stream
             return stream
-        except (CaptureOpenError, CaptureStateError):
+        except CaptureOpenError:
+            self._terminate_worker()
+            raise
+        except CaptureStateError:
             raise
         except (BrokenPipeError, EOFError, OSError, TypeError, ValueError) as error:
             self._terminate_worker()
@@ -347,7 +685,13 @@ class OpenCVProcessCameraBackend:
             self._terminate_worker()
             return CaptureRead(ReadStatus.FATAL_ERROR, reason_code="invalid_worker_response")
         status = message[0]
-        if status == "frame" and len(message) == 7:
+        if type(status) is not str:
+            self._terminate_worker()
+            return CaptureRead(ReadStatus.FATAL_ERROR, reason_code="invalid_worker_response")
+        if status == "frame":
+            if len(message) != 7:
+                self._terminate_worker()
+                return CaptureRead(ReadStatus.FATAL_ERROR, reason_code="invalid_worker_response")
             try:
                 payload = message[1]
                 if not isinstance(payload, bytes):
@@ -376,7 +720,14 @@ class OpenCVProcessCameraBackend:
                 self._terminate_worker()
                 return CaptureRead(ReadStatus.FATAL_ERROR, reason_code="invalid_backend_frame")
             return CaptureRead(ReadStatus.FRAME, frame=frame)
-        reason = _reason(message[1] if len(message) > 1 else None, "camera_worker_error")
+        if status not in {"disconnected", "recoverable", "fatal"} or len(message) != 2:
+            self._terminate_worker()
+            return CaptureRead(ReadStatus.FATAL_ERROR, reason_code="invalid_worker_response")
+        reason = _reason(
+            message[1],
+            "camera_worker_error",
+            _READ_REASON_CODES,
+        )
         if status == "disconnected":
             return CaptureRead(ReadStatus.DISCONNECTED, reason_code=reason)
         if status == "recoverable":
@@ -404,22 +755,36 @@ class OpenCVProcessCameraBackend:
         self._connection = None
         self._request = None
         self._stream = None
+        process_started = self._process_started
         if connection is not None:
             with suppress(OSError):
                 connection.close()
-        if process is not None and self._process_alive_state(process) is not False:
+        if (
+            process is not None
+            and process_started
+            and self._process_alive_state(process) is not False
+        ):
             with suppress(AssertionError, OSError, ValueError):
                 process.terminate()
                 process.join(self._cleanup_timeout_seconds)
-        if process is not None and self._process_alive_state(process) is not False:
+        if (
+            process is not None
+            and process_started
+            and self._process_alive_state(process) is not False
+        ):
             with suppress(AssertionError, OSError, ValueError):
                 process.kill()
                 process.join(self._cleanup_timeout_seconds)
-        if process is not None and self._process_alive_state(process) is not False:
+        if (
+            process is not None
+            and process_started
+            and self._process_alive_state(process) is not False
+        ):
             self._process = process
             self._termination_failed = True
             raise CaptureStateError("camera worker could not be terminated")
         self._process = None
+        self._process_started = False
         self._termination_failed = False
 
     @staticmethod
@@ -436,12 +801,40 @@ def _worker_integer(value: object, field_name: str) -> int:
     return value
 
 
+def _worker_positive_finite(value: object, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"worker {field_name} must be a number")
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric <= 0.0:
+        raise ValueError(f"worker {field_name} must be finite and positive")
+    return numeric
+
+
+def _worker_dimension(value: object, field_name: str) -> int:
+    numeric = _worker_positive_finite(value, field_name)
+    integer = int(numeric)
+    if numeric != integer or integer > MAX_CAPTURE_DIMENSION:
+        raise ValueError(f"worker {field_name} must be a bounded integer")
+    return integer
+
+
+def _worker_negotiated_fps(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("worker fps must be a number or null")
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < 0.0 or numeric > MAX_CAPTURE_FPS:
+        raise ValueError("worker fps must be finite and within bounds")
+    return None if numeric == 0.0 else numeric
+
+
 def _worker_optional_float(value: object, field_name: str) -> float | None:
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, float):
         raise TypeError(f"worker {field_name} must be a float or null")
-    return value
+    return None if value == 0.0 else value
 
 
 def _worker_string(value: object, field_name: str) -> str:

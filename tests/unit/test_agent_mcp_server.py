@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import struct
 import subprocess
 import sys
+import zlib
 from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
@@ -66,6 +69,38 @@ def _snapshot() -> SnapshotEnvelope:
         height=12,
         sensitivity_class="public",
         png_bytes=PNG_SIGNATURE + b"bounded-png",
+    )
+
+
+def _valid_png(width: int = 16, height: int = 12) -> bytes:
+    raw = (b"\x00" + (b"\x00\x00\x00" * width)) * height
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        encoded = kind + payload
+        return (
+            struct.pack(">I", len(payload))
+            + encoded
+            + struct.pack(">I", zlib.crc32(encoded) & 0xFFFFFFFF)
+        )
+
+    return (
+        PNG_SIGNATURE
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _valid_snapshot() -> SnapshotEnvelope:
+    return SnapshotEnvelope(
+        source_id="fixture",
+        stream_epoch=1,
+        source_sequence=2,
+        received_monotonic_ns=5_000_000_000,
+        width=16,
+        height=12,
+        sensitivity_class="public",
+        png_bytes=_valid_png(),
     )
 
 
@@ -176,7 +211,6 @@ def test_lists_exact_versioned_tools_with_safe_annotations_and_effective_limits(
         "idempotentHint": False,
         "openWorldHint": False,
     }
-
     latest_properties = latest.input_schema["properties"]
     snapshot_properties = snapshot.input_schema["properties"]
     assert latest_properties["max_age_ms"]["maximum"] == limits.max_age_ms
@@ -347,10 +381,12 @@ def test_snapshot_uses_full_effective_limits_returns_png_and_allows_retry(
     assert isinstance(first.content[0], TextContent)
     assert json.loads(first.content[0].text)["outcome"] == "busy"
     assert not second.is_error
-    assert len(second.content) == 1
+    assert len(second.content) == 2
     assert isinstance(second.content[0], ImageContent)
+    assert isinstance(second.content[1], TextContent)
     assert second.content[0].mime_type == "image/png"
     assert base64.b64decode(second.content[0].data) == _snapshot().png_bytes
+    assert json.loads(second.content[1].text)["outcome"] == "captured"
     assert provider.calls == [
         (
             service.limits.max_snapshot_edge_px,
@@ -363,6 +399,67 @@ def test_snapshot_uses_full_effective_limits_returns_png_and_allows_retry(
             service.limits.max_wait_ms / 1_000,
         ),
     ]
+
+
+def test_snapshot_success_is_a_two_block_png_receipt_contract(tmp_path: Path) -> None:
+    snapshot = _valid_snapshot()
+    service, _, _ = _service(
+        tmp_path,
+        scopes=frozenset({"snapshot.read"}),
+        quota=1,
+        provider=RecordingSnapshotProvider(SnapshotCaptureResult("ok", snapshot)),
+    )
+    server = create_mcp_server(service)
+
+    async def scenario() -> Any:
+        async with Client(server) as client:
+            return await client.call_tool(
+                SNAPSHOT_TOOL_V1,
+                {"max_edge_px": 64, "wait_ms": 1},
+            )
+
+    result = _run(scenario)
+    assert not result.is_error
+    assert len(result.content) == 2
+    image, receipt = result.content
+    assert isinstance(image, ImageContent)
+    assert isinstance(receipt, TextContent)
+    assert image.mime_type == "image/png"
+    decoded = base64.b64decode(image.data, validate=True)
+    assert decoded == snapshot.png_bytes
+    assert decoded.startswith(PNG_SIGNATURE)
+    assert decoded[12:16] == b"IHDR"
+    assert struct.unpack(">I", decoded[8:12])[0] == 13
+    assert struct.unpack(">II", decoded[16:24]) == (snapshot.width, snapshot.height)
+
+    metadata = {
+        "contract": "urn:viskium:mcp:snapshot:1",
+        "agent_contract": "urn:viskium:agent-read:1",
+        "outcome": "captured",
+        "status": "captured",
+        "schema_version": 1,
+        "mime_type": "image/png",
+        "width": snapshot.width,
+        "height": snapshot.height,
+        "byte_count": len(snapshot.png_bytes),
+        "sha256": hashlib.sha256(snapshot.png_bytes).hexdigest(),
+    }
+    assert result.structured_content == metadata
+    assert json.loads(receipt.text) == metadata
+    assert receipt.text == json.dumps(
+        metadata, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+    wire = result.model_dump(mode="json", by_alias=True)
+    assert wire["structuredContent"] == metadata
+    assert wire["content"][0]["data"] == image.data
+    assert wire["content"][1]["text"] == receipt.text
+    assert sum(isinstance(item, ImageContent) for item in result.content) == 1
+    assert PNG_SIGNATURE.hex() not in receipt.text
+    assert base64.b64encode(snapshot.png_bytes).decode() not in receipt.text
+    assert all(
+        forbidden not in receipt.text.lower()
+        for forbidden in ("bytes", "base64", "path", "pixel", "raw", "png_bytes", "encoded_bytes")
+    )
 
 
 def test_snapshot_denial_is_bounded_machine_readable_and_never_calls_provider(

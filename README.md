@@ -21,7 +21,7 @@ prácticos.
 | SQLite para observaciones estructuradas con TTL, cuotas y consultas acotadas | Validado por pruebas automatizadas |
 | Latest-frame/latest-observation, scheduler y writer con backpressure | Validado como componentes |
 | Controlador de cámara con ownership, deadlines, cooldown y epochs | Validado con dobles y fault tests |
-| Backend OpenCV aislado en proceso y snapshot PNG one-shot | Prototipado; smoke físico local aprobado en un dispositivo |
+| Backend OpenCV aislado en proceso y snapshot PNG one-shot | Prototipado; validado con dobles, fallos inyectados y pruebas de proceso |
 | Servicio MCP local con consentimiento explícito | Prototipado y probado in-memory |
 
 No existen todavía un modelo de visión seleccionado, traducción, UI final, ingestión desde
@@ -43,6 +43,11 @@ La instalación base no obliga a instalar OpenCV ni MCP. Se pueden seleccionar p
 los extras `camera` y `agent`. La ruta ejecutable soportada actualmente es Windows o Linux.
 El modo `faithful` es todavía un replay sintético: conserva la política latest-only bajo tiempos
 fijos y no afirma paridad con jitter, reconexiones, deadlines ni drivers de una cámara física.
+
+El extra `camera` fija `opencv-python==5.0.0.93` en Windows para disponer de Media Foundation y
+DirectShow; en POSIX usa `opencv-python-headless==5.0.0.93`. La política `AUTO` consulta la
+disponibilidad y elige un solo backend antes de abrir el dispositivo; una apertura fallida no
+salta silenciosamente a una segunda API ni realiza una segunda apertura.
 
 ## Almacenamiento local
 
@@ -108,8 +113,8 @@ de agente se convierta accidentalmente en streaming.
 
 ## Prueba física opt-in
 
-Las pruebas normales y CI no abren cámaras. En un equipo autorizado, el smoke solicita una sola
-imagen 640×480, no la muestra ni la guarda y verifica el cierre:
+Las pruebas normales y CI no abren cámaras. En un equipo autorizado, el smoke opt-in solicita una
+sola imagen 640×480, no la muestra ni la guarda y verifica el cierre:
 
 ```powershell
 $env:VISKIUM_RUN_CAMERA_TESTS = "1"
@@ -118,9 +123,9 @@ Remove-Item Env:VISKIUM_RUN_CAMERA_TESTS
 ```
 
 Se puede seleccionar otro dispositivo con `VISKIUM_CAMERA_DEVICE_INDEX`. No ejecutes esta
-prueba sobre hardware ajeno o mientras otra aplicación necesite la cámara. El corte actual pasó
-esta ruta completa con consentimiento, admisión y cliente MCP en un host Windows; eso no sustituye
-pruebas de unplug, busy, sleep/resume ni una caracterización prolongada.
+prueba sobre hardware ajeno o mientras otra aplicación necesite la cámara. La compatibilidad con
+un dispositivo concreto, unplug, busy, sleep/resume y operación prolongada sigue siendo un gate
+opt-in; no se presenta como validada por el repositorio.
 
 ## Gates de ingeniería
 

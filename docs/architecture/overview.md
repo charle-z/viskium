@@ -179,9 +179,9 @@ El transporte MCP opcional expone exactamente:
 - `viskium_snapshot_v1`: como máximo un PNG one-shot bajo grant y cuota existentes.
 
 No existe tool para conceder acceso, abrir una sesión continua, mover una cámara o guardar imágenes.
-Un smoke local 640×480 atravesó grant, admission, cliente MCP in-memory y cierre del worker en una
-cámara Windows. Sigue faltando caracterización multi-dispositivo, unplug/busy/sleep-resume y cliente
-stdio externo con hardware.
+Las pruebas de software recorren grant, admission, cliente MCP in-memory y cierre del worker con
+dobles; la validación física queda opt-in y separada de CI. Sigue faltando caracterización
+multi-dispositivo, unplug/busy/sleep-resume y cliente stdio externo con hardware.
 
 ## Estructura actual
 

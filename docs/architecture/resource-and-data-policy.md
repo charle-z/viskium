@@ -42,6 +42,13 @@ codifica un PNG en memoria y cierra en `finally`. El provider no guarda frame, b
 de devolver. El backend OpenCV importa `cv2` en un proceso hijo y transfiere BGR por memoria; ante
 timeout intenta terminate y luego kill.
 
+El extra `camera` fija `opencv-python==5.0.0.93` en Windows, donde la instalación ofrece Media
+Foundation y DirectShow; en POSIX usa `opencv-python-headless==5.0.0.93`. La política `AUTO`
+consulta disponibilidad, selecciona un único backend antes de abrir y no intenta una segunda API ni
+una segunda apertura si la primera falla. El receipt MCP contiene únicamente contrato, resultado,
+dimensiones, MIME, tamaño y un digest del PNG entregado; no incluye rutas, identificadores del
+dispositivo ni bytes adicionales.
+
 El PNG entregado deja de estar bajo control de Viskium: un cliente MCP, el sistema operativo o una
 herramienta externa puede copiarlo o persistirlo. Tampoco se promete ausencia forense en pagefile,
 crash dumps, memoria del driver o compositor.

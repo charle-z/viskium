@@ -7,6 +7,7 @@ module cannot create grants, stream frames, or control camera lifecycle.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from collections.abc import Awaitable, Callable, Mapping
@@ -464,7 +465,7 @@ def create_mcp_server(service: AgentReadService) -> MCPServer[Any]:
         }
 
     def snapshot_v1(max_edge_px: int, wait_ms: int = 0) -> Any:
-        """Return one consent-gated PNG image; never expose camera lifecycle controls."""
+        """Return one PNG and its bounded receipt; never expose camera lifecycle controls."""
 
         request = {"max_edge_px": max_edge_px, "wait_ms": wait_ms}
         if not _request_within_limit(request, maximum_bytes=limits.max_request_bytes):
@@ -482,7 +483,33 @@ def create_mcp_server(service: AgentReadService) -> MCPServer[Any]:
             return failure
         if snapshot.encoded_bytes > limits.max_snapshot_bytes:
             raise sdk.tool_error_type("invalid bounded snapshot result")
-        return sdk.image_type(data=snapshot.png_bytes, format="png")
+        metadata = {
+            "contract": SNAPSHOT_RESULT_CONTRACT_V1,
+            "agent_contract": result.contract,
+            "outcome": "captured",
+            "status": "captured",
+            "schema_version": 1,
+            "mime_type": snapshot.mime_type,
+            "width": snapshot.width,
+            "height": snapshot.height,
+            "byte_count": snapshot.encoded_bytes,
+            "sha256": hashlib.sha256(snapshot.png_bytes).hexdigest(),
+        }
+        metadata_bytes = bounded_canonical_json_bytes(
+            metadata,
+            max_bytes=limits.max_metadata_bytes,
+        )
+        if metadata_bytes is None:
+            raise sdk.tool_error_type("invalid bounded snapshot result")
+        image_content = sdk.image_type(data=snapshot.png_bytes, format="png").to_image_content()
+        receipt_content = sdk.text_content_type(
+            type="text",
+            text=metadata_bytes.decode("utf-8"),
+        )
+        return sdk.call_tool_result_type(
+            content=[image_content, receipt_content],
+            structured_content=metadata,
+        )
 
     field = sdk.field
     schema_id = Annotated[
