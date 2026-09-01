@@ -135,7 +135,7 @@ def test_windows_socket_transport_uses_only_explicit_handle_list(
     assert inheritable == [(22, True), (22, False)]
     assert not parent_socket.closed
     assert not child_socket.closed
-    assert kwargs.get("creationflags") == getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    assert kwargs.get("creationflags", 0) == getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def test_subprocess_process_wrapper_exposes_bounded_process_lifecycle() -> None:
